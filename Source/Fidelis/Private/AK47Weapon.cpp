@@ -241,7 +241,12 @@ void AAK47Weapon::SetupInput(APlayerController* PC)
 		ReloadAction = NewObject<UInputAction>(this, TEXT("IA_AK47_Reload"));
 		ReloadAction->ValueType = EInputActionValueType::Boolean;
 
+		AimAction = NewObject<UInputAction>(this, TEXT("IA_AK47_Aim"));
+		AimAction->ValueType = EInputActionValueType::Boolean;
+
 		MappingContext = NewObject<UInputMappingContext>(this, TEXT("IMC_AK47"));
+		MappingContext->MapKey(AimAction, EKeys::RightMouseButton);
+		MappingContext->MapKey(AimAction, EKeys::Gamepad_LeftTrigger);
 		MappingContext->MapKey(FireAction, EKeys::LeftMouseButton);
 		MappingContext->MapKey(FireAction, EKeys::Gamepad_RightTrigger);
 		MappingContext->MapKey(ReloadAction, EKeys::R);
@@ -261,6 +266,9 @@ void AAK47Weapon::SetupInput(APlayerController* PC)
 		EIC->BindAction(FireAction, ETriggerEvent::Completed, this, &AAK47Weapon::StopFire);
 		EIC->BindAction(FireAction, ETriggerEvent::Canceled, this, &AAK47Weapon::StopFire);
 		EIC->BindAction(ReloadAction, ETriggerEvent::Started, this, &AAK47Weapon::Reload);
+		EIC->BindAction(AimAction, ETriggerEvent::Started, this, &AAK47Weapon::StartAim);
+		EIC->BindAction(AimAction, ETriggerEvent::Completed, this, &AAK47Weapon::StopAim);
+		EIC->BindAction(AimAction, ETriggerEvent::Canceled, this, &AAK47Weapon::StopAim);
 	}
 	else
 	{
@@ -287,6 +295,17 @@ void AAK47Weapon::TeardownInput()
 	}
 	DisableInput(PC);
 	InputController.Reset();
+	bWantsToAim = false;
+}
+
+void AAK47Weapon::StartAim()
+{
+	bWantsToAim = OwningCharacter.IsValid();
+}
+
+void AAK47Weapon::StopAim()
+{
+	bWantsToAim = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +377,8 @@ void AAK47Weapon::FireShot()
 		Character->GetActorEyesViewPoint(ViewLoc, ViewRot);
 	}
 
-	const float SpreadDeg = FMath::Min(BaseSpreadDegrees + SpreadPerShotDegrees * ConsecutiveShots, MaxSpreadDegrees);
+	const float SpreadDeg = FMath::Min(BaseSpreadDegrees + SpreadPerShotDegrees * ConsecutiveShots, MaxSpreadDegrees)
+		* (IsAiming() ? AimSpreadMultiplier : 1.f);
 	const FVector ShotDir = FMath::VRandCone(ViewRot.Vector(), FMath::DegreesToRadians(SpreadDeg));
 	const FVector TraceEnd = ViewLoc + ShotDir * Range;
 

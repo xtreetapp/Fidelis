@@ -8,6 +8,7 @@
 #include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "EnhancedInputSubsystems.h"
+#include "EnhancedPlayerInput.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
@@ -249,9 +250,48 @@ namespace FidelisDiag
 
 	struct FStep { float Time; TFunction<void(APlayerController*)> Do; };
 
-	static void RunMoves(UWorld* World, bool bQuit)
+	// Custom keys check: W crouch / N dive (new) vs C / V (IMC_Default), standing then running.
+	static TArray<FStep> KeySteps()
 	{
-		TArray<FStep> Steps = {
+		auto Act = [](APlayerController* PC) {
+			const UEnhancedPlayerInput* In = Cast<UEnhancedPlayerInput>(PC->PlayerInput);
+			const ACharacter* Char = Cast<ACharacter>(PC->GetPawn());
+			const USlideComponent* Slide = Char ? Char->FindComponentByClass<USlideComponent>() : nullptr;
+			const UDiveComponent* Dive = Char ? Char->FindComponentByClass<UDiveComponent>() : nullptr;
+			const UInputAction* Crouch = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Crouch.IA_Crouch"));
+			const UInputAction* DiveA = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Dive.IA_Dive"));
+			return FString::Printf(TEXT("IA_Crouch=%d IA_Dive=%d"),
+				In && Crouch ? In->GetActionValue(Crouch).Get<bool>() : -1, In && DiveA ? In->GetActionValue(DiveA).Get<bool>() : -1);
+		};
+		auto R = [Act](const TCHAR* Label) { return [Act, Label](APlayerController* PC) {
+			float EyeH = -1.f;
+			if (const ACharacter* C = Cast<ACharacter>(PC->GetPawn()); C && PC->PlayerCameraManager)
+			{
+				const UCapsuleComponent* Cap = C->GetCapsuleComponent();
+				EyeH = PC->PlayerCameraManager->GetCameraLocation().Z - (Cap->GetComponentLocation().Z - Cap->GetScaledCapsuleHalfHeight());
+			}
+			UE_LOG(LogFidelis, Display, TEXT("DiagKeys [%s]: %s hauteurYeux=%.1f"), Label, *Act(PC), EyeH); Report(PC, Label); }; };
+		return {
+			{ 1.0f, [R](APlayerController* PC) { R(TEXT("depart"))(PC); Key(PC, EKeys::W, true); } },
+			{ 1.6f, [R](APlayerController* PC) { R(TEXT("W tenu a l'arret"))(PC); Key(PC, EKeys::W, false); } },
+			{ 2.2f, [R](APlayerController* PC) { R(TEXT("W relache"))(PC); Key(PC, EKeys::C, true); } },
+			{ 2.8f, [R](APlayerController* PC) { R(TEXT("C tenu a l'arret"))(PC); Key(PC, EKeys::C, false); } },
+			{ 3.4f, [R](APlayerController* PC) { Key(PC, EKeys::N, true); } },
+			{ 3.8f, [R](APlayerController* PC) { R(TEXT("N tenu a l'arret"))(PC); Key(PC, EKeys::N, false); } },
+			{ 4.2f, [R](APlayerController* PC) { Teleport(PC, FVector(0.f, 0.f, 0.f), 0.f); Key(PC, EKeys::I, true); Key(PC, EKeys::LeftShift, true); } },
+			{ 5.4f, [R](APlayerController* PC) { R(TEXT("course I+Maj"))(PC); Key(PC, EKeys::N, true); } },
+			{ 5.7f, [R](APlayerController* PC) { R(TEXT("N en course"))(PC); } },
+			{ 6.6f, [R](APlayerController* PC) { R(TEXT("N tenu apres plongeon"))(PC); Key(PC, EKeys::N, false); } },
+			{ 7.4f, [R](APlayerController* PC) { R(TEXT("N relache"))(PC); } },
+			{ 8.6f, [R](APlayerController* PC) { R(TEXT("course 2"))(PC); Key(PC, EKeys::W, true); } },
+			{ 8.9f, [R](APlayerController* PC) { R(TEXT("W en course"))(PC); Key(PC, EKeys::W, false); } },
+			{ 10.0f,[R](APlayerController* PC) { R(TEXT("fin"))(PC); Key(PC, EKeys::I, false); Key(PC, EKeys::LeftShift, false); } },
+		};
+	}
+
+	static void RunMoves(UWorld* World, bool bQuit, bool bKeys = false)
+	{
+		TArray<FStep> Steps = bKeys ? KeySteps() : TArray<FStep>{
 			{ 1.0f, [](APlayerController* PC) { Report(PC, TEXT("depart")); Key(PC, EKeys::Z, true); Key(PC, EKeys::LeftShift, true); } },
 			{ 2.2f, [](APlayerController* PC) { Report(PC, TEXT("course avant")); Key(PC, EKeys::C, true); } },
 			{ 2.25f,[](APlayerController* PC) { Key(PC, EKeys::C, false); } },
@@ -287,6 +327,7 @@ namespace FidelisDiag
 			{ 16.2f,[](APlayerController* PC) { LeanReport(PC, TEXT("tir relache")); Key(PC, EKeys::ThumbMouseButton2, false); } },
 		};
 
+
 		struct FState { TWeakObjectPtr<UWorld> World; TArray<FStep> Steps; int32 Next = 0; float T = 0.f; bool bQuit = false; int32 QuitIn = -1; };
 		TSharedRef<FState> State = MakeShared<FState>();
 		State->World = World; State->Steps = MoveTemp(Steps); State->bQuit = bQuit;
@@ -316,6 +357,234 @@ namespace FidelisDiag
 		}));
 	}
 }
+
+// ---------------------------------------------------------------------------
+// fidelis.DiagAim [quit]: holds aim (RMB) while standing, walking and running in several directions,
+// and logs every frame where the rifle sits in camera space. A rifle locked to the view gives constant
+// numbers; anything that varies while moving is the movement the player sees.
+// ---------------------------------------------------------------------------
+namespace FidelisDiagAim
+{
+	struct FState
+	{
+		TWeakObjectPtr<UWorld> World;
+		float T = 0.f;
+		int32 Phase = -1;
+		bool bQuit = false;
+		bool bAim = true;
+		int32 QuitIn = -1;
+		int32 Frame = 0;
+		// Smoothness: frame-to-frame motion of the muzzle in view space.
+		FVector PrevMuzzle = FVector::ZeroVector, PrevDelta = FVector::ZeroVector;
+		bool bHasPrev = false;
+		int32 Stalls = 0;
+		float MaxJerk = 0.f, SumStep = 0.f, MaxStep = 0.f;
+		// Per-phase min/max of the muzzle and rifle origin in view space.
+		FVector MinMuzzle, MaxMuzzle, MinOrigin, MaxOrigin, MinCamRel, MaxCamRel;
+		int32 Samples = 0;
+	};
+
+	struct FPhase { float Start; const TCHAR* Name; TArray<FKey> Keys; };
+
+	static const TArray<FPhase>& Phases()
+	{
+		static const TArray<FPhase> P = {
+			{ 0.0f, TEXT("arret (visee)"), {} },
+			{ 1.5f, TEXT("avant"), { EKeys::I } },
+			{ 5.5f, TEXT("arriere"), { EKeys::K } },
+			{ 7.0f, TEXT("droite"), { EKeys::L } },
+			{ 8.5f, TEXT("gauche"), { EKeys::J } },
+			{ 10.0f, TEXT("fin"), {} },
+		};
+		return P;
+	}
+
+	static void ResetStats(FState& S)
+	{
+		S.MinMuzzle = S.MinOrigin = S.MinCamRel = FVector(BIG_NUMBER);
+		S.MaxMuzzle = S.MaxOrigin = S.MaxCamRel = FVector(-BIG_NUMBER);
+		S.Samples = 0;
+		S.bHasPrev = false;
+		S.Stalls = 0;
+		S.MaxJerk = S.SumStep = S.MaxStep = 0.f;
+	}
+
+	static void Flush(FState& S, const TCHAR* Name)
+	{
+		if (S.Samples == 0) { return; }
+		UE_LOG(LogFidelis, Display, TEXT("DiagAim [%s] %d images: bouche (vue: avant/droite/haut) min %s max %s ecart %s"),
+			Name, S.Samples, *S.MinMuzzle.ToCompactString(), *S.MaxMuzzle.ToCompactString(), *(S.MaxMuzzle - S.MinMuzzle).ToCompactString());
+		UE_LOG(LogFidelis, Display, TEXT("DiagAim [%s] origine fusil (vue) ecart %s | camera (repere perso) ecart %s"),
+			Name, *(S.MaxOrigin - S.MinOrigin).ToCompactString(), *(S.MaxCamRel - S.MinCamRel).ToCompactString());
+		UE_LOG(LogFidelis, Display, TEXT("DiagAim [%s] fluidite: pas moyen %.3f cm, pas max %.3f cm, a-coup max %.3f cm, images figees %d / %d"),
+			Name, S.SumStep / FMath::Max(1, S.Samples - 1), S.MaxStep, S.MaxJerk, S.Stalls, S.Samples);
+	}
+
+	static void Run(UWorld* World, bool bQuit, bool bAim)
+	{
+		TSharedRef<FState> State = MakeShared<FState>();
+		State->World = World;
+		State->bQuit = bQuit;
+		State->bAim = bAim;
+		ResetStats(*State);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([State](float Dt) -> bool
+		{
+			if (State->QuitIn >= 0)
+			{
+				if (State->QuitIn-- == 0) { FPlatformMisc::RequestExit(false, TEXT("fidelis.DiagAim")); return false; }
+				return true;
+			}
+			UWorld* W = State->World.Get();
+			APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
+			ACharacter* Char = PC ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+			if (!Char || !PC->PlayerCameraManager) { return true; }
+
+			const TArray<FPhase>& P = Phases();
+			if (State->Phase < 0)
+			{
+				if (State->bAim) { FidelisDiag::Key(PC, EKeys::RightMouseButton, true); }
+				State->Phase = 0;
+				UE_LOG(LogFidelis, Display, TEXT("DiagAim: debut, visee maintenue."));
+				TArray<USkeletalMeshComponent*> Meshes; Char->GetComponents<USkeletalMeshComponent>(Meshes);
+				for (const USkeletalMeshComponent* M : Meshes)
+				{
+					UE_LOG(LogFidelis, Display, TEXT("DiagAim: mesh %s URO=%d visTick=%d anim=%s"), *M->GetName(), M->bEnableUpdateRateOptimizations,
+						(int32)M->VisibilityBasedAnimTickOption, *GetNameSafe(M->GetAnimInstance()));
+				}
+			}
+
+			State->T += FMath::Min(Dt, 0.05f);
+			const int32 NextPhase = State->Phase + 1;
+			if (NextPhase < P.Num() && State->T >= P[NextPhase].Start)
+			{
+				Flush(*State, P[State->Phase].Name);
+				ResetStats(*State);
+				for (const FKey& K : P[State->Phase].Keys) { FidelisDiag::Key(PC, K, false); }
+				State->Phase = NextPhase;
+				for (const FKey& K : P[State->Phase].Keys) { FidelisDiag::Key(PC, K, true); }
+				if (State->Phase == P.Num() - 1)
+				{
+					FidelisDiag::Key(PC, EKeys::RightMouseButton, false);
+					UE_LOG(LogFidelis, Display, TEXT("DiagAim: fin."));
+					if (State->bQuit) { State->QuitIn = 5; return true; }
+					return false;
+				}
+			}
+
+			// Screenshots: running (sprint pose) early in the forward phase, walking later.
+			{
+				static const float ShotTimes[] = { 1.2f, 2.1f, 4.6f };
+				static const TCHAR* ShotNames[] = { TEXT("arret"), TEXT("course"), TEXT("marche") };
+				for (int32 i = 0; i < 3; ++i)
+				{
+					if (State->T >= ShotTimes[i] && State->T - FMath::Min(Dt, 0.05f) < ShotTimes[i])
+					{
+						const USlideComponent* Slide = Char->FindComponentByClass<USlideComponent>();
+						const ULeanComponent* Lean = Char->FindComponentByClass<ULeanComponent>();
+						UE_LOG(LogFidelis, Display, TEXT("DiagAim capture %s: course=%d poseCourse=%.2f vitesse=%.0f controle=%s camera=%s pos=%s"), ShotNames[i],
+							Slide && Slide->IsSprinting(), Lean ? Lean->GetSprintPoseAlpha() : -1.f, Char->GetVelocity().Size2D(),
+							*PC->GetControlRotation().ToCompactString(), *PC->PlayerCameraManager->GetCameraRotation().ToCompactString(),
+							*Char->GetActorLocation().ToCompactString());
+						FScreenshotRequest::RequestScreenshot(FPaths::ProjectSavedDir() / FString::Printf(TEXT("Screenshots/DiagAim_%s_%s.png"),
+							State->bAim ? TEXT("visee") : TEXT("hanche"), ShotNames[i]), false, false);
+					}
+				}
+			}
+
+			{
+				static float LastPitch = 0.f;
+				const float Pitch = FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+				if (!FMath::IsNearlyEqual(Pitch, LastPitch, 0.01f))
+				{
+					UE_LOG(LogFidelis, Display, TEXT("DiagAim t=%.2f pitch %.2f -> %.2f (vitesse %.0f, sol=%d, pos %s)"), State->T, LastPitch, Pitch,
+						Char->GetVelocity().Size2D(), Char->GetCharacterMovement()->IsMovingOnGround(), *Char->GetActorLocation().ToCompactString());
+					LastPitch = Pitch;
+				}
+			}
+
+			// Skip the first 0.5 s of each phase (aim blend / acceleration), then measure.
+			if (State->T - P[State->Phase].Start < 0.5f) { return true; }
+
+			const AAK47Weapon* AK = nullptr;
+			TArray<AActor*> Attached; Char->GetAttachedActors(Attached);
+			for (AActor* A : Attached) { if (const AAK47Weapon* Wp = Cast<AAK47Weapon>(A)) { AK = Wp; } }
+			const USkeletalMeshComponent* Gun = AK ? AK->GetFirstPersonMesh() : nullptr;
+			if (!Gun) { return true; }
+
+			const FTransform View(PC->PlayerCameraManager->GetCameraRotation(), PC->PlayerCameraManager->GetCameraLocation());
+			const FVector Muzzle = View.InverseTransformPosition(Gun->DoesSocketExist(TEXT("Muzzle")) ? Gun->GetSocketLocation(TEXT("Muzzle")) : Gun->GetComponentLocation());
+			const FVector Origin = View.InverseTransformPosition(Gun->GetComponentLocation());
+			const FVector CamRel = Char->GetActorTransform().InverseTransformPosition(View.GetLocation());
+			const UCameraComponent* CamComp = Char->FindComponentByClass<UCameraComponent>();
+			const FVector CompRel = CamComp ? Char->GetActorTransform().InverseTransformPosition(CamComp->GetComponentLocation()) : FVector::ZeroVector;
+			const FVector GunRel = Char->GetActorTransform().InverseTransformPosition(Gun->GetComponentLocation());
+
+			State->MinMuzzle = State->MinMuzzle.ComponentMin(Muzzle); State->MaxMuzzle = State->MaxMuzzle.ComponentMax(Muzzle);
+			State->MinOrigin = State->MinOrigin.ComponentMin(Origin); State->MaxOrigin = State->MaxOrigin.ComponentMax(Origin);
+			State->MinCamRel = State->MinCamRel.ComponentMin(CamRel); State->MaxCamRel = State->MaxCamRel.ComponentMax(CamRel);
+			if (State->bHasPrev)
+			{
+				const FVector Delta = Muzzle - State->PrevMuzzle;
+				const float Step = Delta.Size();
+				State->SumStep += Step;
+				State->MaxStep = FMath::Max(State->MaxStep, Step);
+				State->MaxJerk = FMath::Max(State->MaxJerk, (Delta - State->PrevDelta).Size());
+				if (Step < 0.001f && State->PrevDelta.Size() > 0.02f) { ++State->Stalls; }
+				State->PrevDelta = Delta;
+				// Frame by frame dump for a short window while moving forward.
+				if (FCString::Strcmp(P[State->Phase].Name, TEXT("avant")) == 0 && State->T > 2.5f && State->T < 2.9f)
+				{
+					UE_LOG(LogFidelis, Display, TEXT("DiagAim image dt=%.4f bouche=%s pas=%.3f"), Dt, *Muzzle.ToCompactString(), Step);
+				}
+			}
+			State->PrevMuzzle = Muzzle;
+			State->bHasPrev = true;
+			++State->Samples;
+
+			const bool bOdd = FMath::Abs(Muzzle.Z - State->MinMuzzle.Z) > 0.05f || FMath::Abs(Muzzle.Z - State->MaxMuzzle.Z) > 0.05f;
+			if ((State->Frame++ % 10) == 0 && !bOdd)
+			{
+				UE_LOG(LogFidelis, Display, TEXT("DiagAim [%s] t=%.2f vitesse=%.0f visee=%d bouche=%s origine=%s camera=%s composantCamera=%s (%s, parent %s/%s) fusil(perso)=%s"),
+					P[State->Phase].Name, State->T, Char->GetVelocity().Size2D(), AK->IsAiming(),
+					*Muzzle.ToCompactString(), *Origin.ToCompactString(), *CamRel.ToCompactString(), *CompRel.ToCompactString(),
+					*GetNameSafe(CamComp), *GetNameSafe(CamComp ? CamComp->GetAttachParent() : nullptr), CamComp ? *CamComp->GetAttachSocketName().ToString() : TEXT("-"),
+					*GunRel.ToCompactString());
+			}
+			return true;
+		}));
+	}
+}
+
+static FAutoConsoleCommandWithWorldAndArgs GFidelisDiagAimCmd(
+	TEXT("fidelis.DiagAim"),
+	TEXT("Visee + deplacements: mesure si le fusil bouge par rapport a la camera. Argument optionnel: quit."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			if (Ctx.World() && Ctx.World()->IsGameWorld())
+			{
+				FidelisDiagAim::Run(Ctx.World(), Args.Contains(TEXT("quit")), !Args.Contains(TEXT("noaim")));
+				return;
+			}
+		}
+	}));
+
+static FAutoConsoleCommandWithWorldAndArgs GFidelisDiagKeysCmd(
+	TEXT("fidelis.DiagKeys"),
+	TEXT("Test des touches perso: W accroupi, N allonge (a l'arret et en course), compare a C / V. Argument optionnel: quit."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			if (Ctx.World() && Ctx.World()->IsGameWorld())
+			{
+				FidelisDiag::RunMoves(Ctx.World(), Args.Contains(TEXT("quit")), /*bKeys*/ true);
+				return;
+			}
+		}
+	}));
 
 static FAutoConsoleCommandWithWorldAndArgs GFidelisDiagMovesCmd(
 	TEXT("fidelis.DiagMoves"),

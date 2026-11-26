@@ -36,3 +36,7 @@ compile_commands.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated solution files / local shortcuts
+*.slnx
+*.lnk

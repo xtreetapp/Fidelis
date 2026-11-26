@@ -20,7 +20,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnAK47AmmoChanged, int32, AmmoInMa
  *
  * Has a first-person mesh (seen only by the owning player) and a world-space mesh
  * (seen by everyone else / in shadows), both attached to the owning character's hand.
- * Input (LMB = fire, R = reload) is created at runtime, so no input assets are required.
+ * Input (LMB = fire, RMB = aim down sights, R = reload) is created at runtime, so no input assets
+ * are required. The aiming pose itself is applied by ULeanComponent, which drives the arms.
  */
 UCLASS(Blueprintable)
 class FIDELIS_API AAK47Weapon : public AActor
@@ -58,6 +59,13 @@ public:
 
 	/** Runtime-created fire input action (read-only access, e.g. for lean-fire). */
 	const UInputAction* GetFireAction() const { return FireAction; }
+
+	/** True while the aim button (RMB) is held and the rifle isn't reloading. */
+	UFUNCTION(BlueprintPure, Category = "AK47")
+	bool IsAiming() const { return bWantsToAim && !bIsReloading; }
+
+	/** First-person rifle mesh (used to line the sights up with the camera). */
+	USkeletalMeshComponent* GetFirstPersonMesh() const { return FirstPersonMesh; }
 
 	UPROPERTY(BlueprintAssignable, Category = "AK47")
 	FOnAK47AmmoChanged OnAmmoChanged;
@@ -108,6 +116,10 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "AK47|Stats", meta = (ClampMin = 0))
 	float MaxSpreadDegrees = 3.f;
 
+	/** Spread multiplier while aiming down sights (RMB). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "AK47|Stats", meta = (ClampMin = 0))
+	float AimSpreadMultiplier = 0.3f;
+
 	/** Camera kick per shot (degrees, applied upward). */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "AK47|Stats", meta = (ClampMin = 0))
 	float RecoilPitch = 0.45f;
@@ -153,6 +165,8 @@ protected:
 private:
 	void FireShot();
 	void FinishReload();
+	void StartAim();
+	void StopAim();
 	void SetupInput(APlayerController* PC);
 	void TeardownInput();
 	void BroadcastAmmo();
@@ -171,6 +185,9 @@ private:
 	TObjectPtr<UInputAction> ReloadAction;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UInputAction> AimAction;
+
+	UPROPERTY(Transient)
 	TObjectPtr<UInputMappingContext> MappingContext;
 
 	UPROPERTY(Transient)
@@ -186,5 +203,6 @@ private:
 	int32 ConsecutiveShots = 0;
 	double LastFireTime = -1.0;
 	bool bWantsToFire = false;
+	bool bWantsToAim = false;
 	bool bIsReloading = false;
 };

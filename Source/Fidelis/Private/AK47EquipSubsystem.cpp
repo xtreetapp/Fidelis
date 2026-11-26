@@ -7,6 +7,11 @@
 #include "BunnyHopComponent.h"
 #include "Fidelis.h"
 #include "Engine/GameInstance.h"
+#include "Engine/LocalPlayer.h"
+#include "EnhancedInputSubsystems.h"
+#include "InputAction.h"
+#include "InputMappingContext.h"
+#include "InputModifiers.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerController.h"
@@ -99,8 +104,10 @@ void UAK47EquipSubsystem::HandlePawnControllerChanged(APawn* Pawn, AController* 
 void UAK47EquipSubsystem::SetupPlayerCharacter(APawn* Pawn)
 {
 	ACharacter* Character = Cast<ACharacter>(Pawn);
-	if (Character && Cast<APlayerController>(Character->GetController()))
+	if (APlayerController* PC = Character ? Cast<APlayerController>(Character->GetController()) : nullptr)
 	{
+		AddMovementKeys(PC);
+
 		// Movement abilities (independent of the AK-47). If the character Blueprint already has one of
 		// these components (added in the editor to tweak its settings), that one is used as-is.
 		if (!Character->FindComponentByClass<USlideComponent>())
@@ -118,6 +125,52 @@ void UAK47EquipSubsystem::SetupPlayerCharacter(APawn* Pawn)
 	}
 
 	EquipAK47(Pawn);
+}
+
+void UAK47EquipSubsystem::AddMovementKeys(APlayerController* PC)
+{
+	if (!PC || !PC->IsLocalController())
+	{
+		return;
+	}
+
+	if (!MovementKeysContext)
+	{
+		const UInputAction* MoveAction = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Move.IA_Move"));
+		const UInputAction* JumpAction = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Jump.IA_Jump"));
+		const UInputAction* CrouchAction = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Crouch.IA_Crouch"));
+		const UInputAction* DiveAction = LoadObject<UInputAction>(nullptr, TEXT("/Game/Input/Actions/IA_Dive.IA_Dive"));
+		if (!MoveAction || !JumpAction || !CrouchAction || !DiveAction)
+		{
+			UE_LOG(LogFidelis, Error, TEXT("Touches: actions introuvables dans /Game/Input/Actions (move=%s jump=%s crouch=%s dive=%s)."),
+				*GetNameSafe(MoveAction), *GetNameSafe(JumpAction), *GetNameSafe(CrouchAction), *GetNameSafe(DiveAction));
+			return;
+		}
+
+		// Higher priority than IMC_Default (0): a key mapped here is consumed, so Z jumps instead of
+		// moving forward, without editing the IMC_Default asset.
+		MovementKeysContext = NewObject<UInputMappingContext>(this, TEXT("IMC_Fidelis_CustomKeys"));
+		MovementKeysContext->MapKey(JumpAction, EKeys::Z);   // sauter
+		MovementKeysContext->MapKey(CrouchAction, EKeys::W); // s'accroupir (glissade en courant)
+		MovementKeysContext->MapKey(DiveAction, EKeys::N);   // s'allonger (plongeon en courant)
+
+		// Same convention as IMC_Default: IA_Move is a 2D axis, X = right, Y = forward.
+		auto Swizzle = [this]() { return NewObject<UInputModifierSwizzleAxis>(MovementKeysContext); }; // X -> Y
+		auto Negate = [this]() { return NewObject<UInputModifierNegate>(MovementKeysContext); };
+
+		MovementKeysContext->MapKey(MoveAction, EKeys::I).Modifiers.Add(Swizzle());   // avancer
+		FEnhancedActionKeyMapping& Back = MovementKeysContext->MapKey(MoveAction, EKeys::K); // reculer
+		Back.Modifiers.Add(Swizzle());
+		Back.Modifiers.Add(Negate());
+		MovementKeysContext->MapKey(MoveAction, EKeys::J).Modifiers.Add(Negate());    // gauche
+		MovementKeysContext->MapKey(MoveAction, EKeys::L);                             // droite
+	}
+
+	if (UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(PC->GetLocalPlayer()))
+	{
+		Subsystem->AddMappingContext(MovementKeysContext, /*Priority*/ 1);
+		UE_LOG(LogFidelis, Log, TEXT("Touches: I/K avant/arriere, J/L gauche/droite, Z sauter, W s'accroupir, N s'allonger."));
+	}
 }
 
 AAK47Weapon* UAK47EquipSubsystem::EquipAK47(APawn* Pawn)
@@ -169,7 +222,7 @@ AAK47Weapon* UAK47EquipSubsystem::EquipAK47(APawn* Pawn)
 			*Character->GetActorLocation().ToString());
 		Weapon->EquipTo(Character);
 
-		// Lean-fire (Thumb01 / Thumb02 while holding fire). Independent of the weapon logic.
+		// Lean (Thumb01 / Thumb02, firing or not). Independent of the weapon logic.
 		if (!Character->FindComponentByClass<ULeanComponent>())
 		{
 			ULeanComponent* Lean = NewObject<ULeanComponent>(Character, TEXT("LeanComponent"));

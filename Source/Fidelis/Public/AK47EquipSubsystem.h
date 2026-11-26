@@ -7,6 +7,8 @@
 class AAK47Weapon;
 class AController;
 class APawn;
+class APlayerController;
+class UInputMappingContext;
 
 /**
  * Gives every player-controlled character an AK-47 as soon as it is possessed
@@ -37,6 +39,12 @@ public:
 
 private:
 	void BindPossessionDelegate();
+
+	/** Adds the custom keys on top of IMC_Default: I/K forward/back, J/L strafe, Z jump, W crouch, N dive/prone. */
+	void AddMovementKeys(APlayerController* PC);
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInputMappingContext> MovementKeysContext;
 
 	UFUNCTION()
 	void HandlePawnControllerChanged(APawn* Pawn, AController* Controller);
