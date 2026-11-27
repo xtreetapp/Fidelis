@@ -252,11 +252,25 @@ void UDiveComponent::Land(bool bKeyHeld)
 	SetMoveLocked(ProneMoveSpeed <= 0.f);
 
 	State = EFidelisDiveState::Prone;
-	bProneFromBack = DiveDir == EFidelisDiveDirection::Backward;
+	// Lying down: the body keeps the orientation it landed with, and the view turning away from it rolls it
+	// over (back / flanks / belly). BackBodyYaw is where its feet point, set so the landing position is the
+	// current one: feet in front on the back, behind on the belly, to the side on a flank.
+	bProneFromBack = bProneBodyFollowsView || DiveDir == EFidelisDiveDirection::Backward;
+	{
+		const AController* Controller = Char->GetController();
+		const float ViewYaw = Controller ? Controller->GetControlRotation().Yaw : Char->GetActorRotation().Yaw;
+		switch (DiveDir)
+		{
+		case EFidelisDiveDirection::Backward:	BackBodyYaw = Char->GetActorRotation().Yaw; CurrentBodyRoll = 0.f; break;
+		case EFidelisDiveDirection::Right:		BackBodyYaw = ViewYaw - 90.f; CurrentBodyRoll = 90.f; break;
+		case EFidelisDiveDirection::Left:		BackBodyYaw = ViewYaw + 90.f; CurrentBodyRoll = -90.f; break;
+		default:								BackBodyYaw = ViewYaw + 180.f; CurrentBodyRoll = 180.f; break;
+		}
+		BackBodyYaw = FRotator::NormalizeAxis(BackBodyYaw);
+	}
 
 	if (DiveDir == EFidelisDiveDirection::Backward)
 	{
-		BackBodyYaw = Char->GetActorRotation().Yaw;
 		// On the back: look down along the body so the feet are in view.
 		if (AController* Controller = Char->GetController())
 		{
@@ -292,10 +306,27 @@ void UDiveComponent::StandUp(const TCHAR* Reason)
 			Char->UnCrouch();
 		}
 	}
+	ProneSlideTimeLeft = 0.f;
 	RestoreMovementSettings();
 	State = EFidelisDiveState::None;
+	bProneAutoStand = false;
 	LastStandTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
 	UE_LOG(LogFidelis, Log, TEXT("Dive: releve (%s)."), Reason);
+}
+
+void UDiveComponent::EndProneSlide(const TCHAR* Reason)
+{
+	ProneSlideTimeLeft = 0.f;
+	// Back to the normal lying down: the leftover speed brakes down like after a dive's belly slide, then
+	// crawling takes over.
+	if (UCharacterMovementComponent* CMC = Movement.Get())
+	{
+		CMC->MaxWalkSpeedCrouched = ProneMoveSpeed;
+		CMC->GroundFriction = LandingFriction;
+		CMC->BrakingDecelerationWalking = LandingBraking;
+	}
+	SetMoveLocked(ProneMoveSpeed <= 0.f);
+	UE_LOG(LogFidelis, Log, TEXT("Dive: fin de la glissade allongee (%s) apres %.2f s."), Reason, ProneSlideElapsed);
 }
 
 void UDiveComponent::RestoreMovementSettings()
@@ -340,8 +371,15 @@ void UDiveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 	}
 
 	const bool bHeld = IsActionHeld(PC, DiveAction);
-	const bool bPressed = bHeld && !bDiveWasHeld;
+	bool bPressed = bHeld && !bDiveWasHeld;
+	// Slide after a roll: it plays out in full, only crouch or jump stop it (not the dive key).
+	if (const USlideComponent* SlideAfterRoll = Char->FindComponentByClass<USlideComponent>();
+		SlideAfterRoll && SlideAfterRoll->IsSlideFromRoll())
+	{
+		bPressed = false;
+	}
 	bDiveWasHeld = bHeld;
+
 
 	const bool bCrouchHeld = IsActionHeld(PC, CrouchAction);
 	const bool bCrouchPressed = bCrouchHeld && !bCrouchWasHeld;
@@ -355,16 +393,45 @@ void UDiveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 		{
 			// Sliding, whatever the direction: drop flat right away, carrying the slide's momentum into
 			// the belly slide.
+			const float SlideTimeLeft = Slide->GetSlideTimeLeft();
+			const FVector SlideVel2D(CMC->Velocity.X, CMC->Velocity.Y, 0.f);
 			Slide->CancelSlide(TEXT("allonge"));
 			// Still crouched from the slide: the movement component would keep the slide-sized capsule.
 			// Stand it up now so the crouch below takes the prone size.
 			CMC->UnCrouch(false);
 			SaveMovementSettings();
-			DiveDir = EFidelisDiveDirection::None;
-			UE_LOG(LogFidelis, Log, TEXT("Dive: allonge depuis la glissade."));
+			// Side slide: the body leans over into the lying position on the far flank (slide to the left
+			// -> ends lying on the right flank, and the other way round). Forward / backward: on the belly.
+			const FVector SlideLocal = FRotator(0.f, Char->GetControlRotation().Yaw, 0.f).UnrotateVector(CMC->Velocity.GetSafeNormal2D());
+			DiveDir = SlideLocal.Y < -0.5f ? EFidelisDiveDirection::Right
+				: SlideLocal.Y > 0.5f ? EFidelisDiveDirection::Left
+				: EFidelisDiveDirection::None;
+			UE_LOG(LogFidelis, Log, TEXT("Dive: allonge depuis la glissade%s."),
+				DiveDir == EFidelisDiveDirection::Right ? TEXT(" vers la gauche -> sur le flanc droit")
+				: DiveDir == EFidelisDiveDirection::Left ? TEXT(" vers la droite -> sur le flanc gauche") : TEXT(""));
 			Land(/*bKeyHeld*/ true);
 			// Shrink to the prone capsule in the same frame (no standing frame in between).
 			CMC->Crouch(false);
+
+			// Side slide: the slide carries on lying down with the same speeds (no crawl-speed cap, no
+			// friction), from the current speed down to the slide's end speed over the time it had left.
+			const bool bSideSlide = DiveDir == EFidelisDiveDirection::Left || DiveDir == EFidelisDiveDirection::Right;
+			if (bSideSlide && SlideTimeLeft > 0.f && !SlideVel2D.IsNearlyZero())
+			{
+				ProneSlideTimeLeft = SlideTimeLeft;
+				ProneSlideElapsed = 0.f;
+				ProneSlideStartSpeed = SlideVel2D.Size();
+				ProneSlideFromElapsed = Slide->GetSlideElapsed();
+				ProneSlideSource = Slide;
+				ProneSlideEndSpeed = Slide->SlideEndSpeed;
+				ProneSlideDir = SlideVel2D.GetSafeNormal();
+				CMC->MaxWalkSpeedCrouched = FMath::Max(ProneSlideStartSpeed, ProneSlideEndSpeed);
+				CMC->GroundFriction = 0.f;
+				CMC->BrakingDecelerationWalking = 0.f;
+				SetMoveLocked(true); // no steering during the slide, like the slide itself
+				UE_LOG(LogFidelis, Log, TEXT("Dive: la glissade continue allonge (%.0f -> %.0f cm/s en %.2f s)."),
+					ProneSlideStartSpeed, ProneSlideEndSpeed, ProneSlideTimeLeft);
+			}
 		}
 		else if (bPressed && CanStartDive())
 		{
@@ -382,6 +449,18 @@ void UDiveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 
 	case EFidelisDiveState::Airborne:
 		AirTime += DeltaTime;
+
+		// Long dive (from a height): the air braking doesn't take the horizontal speed below
+		// DiveMinAirSpeed. A sudden drop below half of it is a wall: leave that alone.
+		if (DiveMinAirSpeed > 0.f && CMC->IsFalling())
+		{
+			const float Speed2D = CMC->Velocity.Size2D();
+			if (Speed2D < DiveMinAirSpeed && Speed2D > DiveMinAirSpeed * 0.5f)
+			{
+				const FVector Dir2D = CMC->Velocity.GetSafeNormal2D();
+				CMC->Velocity = Dir2D * DiveMinAirSpeed + FVector(0.f, 0.f, CMC->Velocity.Z);
+			}
+		}
 
 		// Dive key then crouch key -> roll right away, even in the air: the body tucks in and turns
 		// now, and the roll carries on along the ground after landing.
@@ -401,7 +480,11 @@ void UDiveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 			}
 			else
 			{
-				Land(bHeld);
+				// The dive always ends fully lying down. Key released: back up on its own after a moment.
+				Land(bHeld || bAlwaysLandProne);
+				bProneAutoStand = !bHeld && State == EFidelisDiveState::Prone;
+				ProneAutoStandTime = -1.0;
+				ProneLandTime = GetWorld()->GetTimeSeconds();
 			}
 		}
 		break;
@@ -413,18 +496,80 @@ void UDiveComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 			ProneFromRoll(TEXT("touche pendant la roulade"));
 			break;
 		}
+		// Side roll: end leaning to the other side (dive's view tilt) if a slide follows (standing or
+		// crouched), i.e. the dive key is not held. Smoothed so a key change never snaps the view.
+		{
+			const bool bSideRoll = DiveDir == EFidelisDiveDirection::Left || DiveDir == EFidelisDiveDirection::Right;
+			const float RollSide = DiveDir == EFidelisDiveDirection::Right ? 1.f : -1.f;
+			const float WantedLean = (bRollEndsLeaning && bSideRoll && !bHeld) ? -RollSide * SideDiveRollAngle : 0.f;
+			RollEndLean = FMath::FInterpTo(RollEndLean, WantedLean, DeltaTime, 10.f);
+		}
 		TickRoll(DeltaTime);
 		// Roll over with the dive key held: stay down instead of standing up.
 		if (State == EFidelisDiveState::None && bHeld && bRollEndedOnGround)
 		{
 			ProneFromRoll(TEXT("touche tenue en fin de roulade"));
 		}
+		// Roll over on the ground: the standing slide takes over in this same frame.
+		else if (State == EFidelisDiveState::None && bRollEndedOnGround)
+		{
+			if (USlideComponent* AfterRollSlide = Char->FindComponentByClass<USlideComponent>())
+			{
+				// The slide starts on the lean the roll ended on (view identity from the roll from now on).
+				const bool bSideRoll = DiveDir == EFidelisDiveDirection::Left || DiveDir == EFidelisDiveDirection::Right;
+				AfterRollSlide->StartSlideAfterRoll(LastRollEndTime, RollEndSpeed, bSideRoll && bRollTurnsView ? RollEndLean : 0.f);
+			}
+		}
 		break;
 
 	case EFidelisDiveState::Prone:
-		if (!bHeld)
+		if (bProneAutoStand)
+		{
+			if (bHeld)
+			{
+				bProneAutoStand = false; // key held again: stays down until it is released
+			}
+			else
+			{
+				// Get up once the belly slide is over (crawl speed) and the body has lain still a moment;
+				// standing up mid-slide would stop it dead. Safety net: never more than 2 s down.
+				const double Now = GetWorld()->GetTimeSeconds();
+				if (ProneAutoStandTime < 0.0 && CMC->Velocity.Size2D() <= ProneMoveSpeed + 10.f)
+				{
+					ProneAutoStandTime = Now + ProneAfterDiveTime;
+				}
+				if ((ProneAutoStandTime >= 0.0 && Now >= ProneAutoStandTime) || Now - ProneLandTime > 2.0)
+				{
+					StandUp(TEXT("fin du plongeon"));
+					break;
+				}
+			}
+		}
+		else if (!bHeld)
 		{
 			StandUp(TEXT("touche relachee"));
+			break;
+		}
+		// Side slide carrying on lying down: same linear speed decay as the slide.
+		if (ProneSlideTimeLeft > 0.f)
+		{
+			ProneSlideElapsed += DeltaTime;
+			if (ProneSlideElapsed >= ProneSlideTimeLeft)
+			{
+				EndProneSlide(TEXT("distance atteinte"));
+			}
+			else if (ProneSlideElapsed > 0.1f && CMC->Velocity.Size2D() < ProneSlideEndSpeed * 0.5f)
+			{
+				EndProneSlide(TEXT("obstacle"));
+			}
+			else
+			{
+				// Same speed curve as the slide it comes from (peak at the start, slows down at the end).
+				const USlideComponent* Source = ProneSlideSource.Get();
+				const float Speed = Source ? Source->GetSlideSpeedAt(ProneSlideFromElapsed + ProneSlideElapsed)
+					: FMath::Lerp(ProneSlideStartSpeed, ProneSlideEndSpeed, ProneSlideElapsed / ProneSlideTimeLeft);
+				CMC->Velocity = ProneSlideDir * Speed + FVector(0.f, 0.f, CMC->Velocity.Z);
+			}
 			break;
 		}
 		// Once the belly slide has slowed down to crawl speed, give back the normal ground grip so
@@ -456,13 +601,18 @@ FQuat UDiveComponent::GetRollViewRotation() const
 	}
 	// Eased so the turn starts and ends gently, and ends exactly level when the roll ends.
 	const float T = FMath::Clamp(RollElapsed / RollDuration, 0.f, 1.f);
-	const float Angle = 360.f * RollViewTurns * FMath::InterpEaseInOut(0.f, 1.f, T, 2.f);
+	// Turning speed rises steadily to its peak at RollViewPeakTime (fraction of the roll), then falls
+	// steadily to 0 at the end (triangle speed profile): early peak = fast spin right from the start.
+	const float Peak = FMath::Clamp(RollViewPeakTime, 0.01f, 0.99f);
+	const float Ease = T < Peak ? T * T / Peak : 1.f - FMath::Square(1.f - T) / (1.f - Peak);
+	const float Angle = 360.f * RollViewTurns * Ease;
 	switch (DiveDir)
 	{
 	case EFidelisDiveDirection::Forward:	return FRotator(-Angle, 0.f, 0.f).Quaternion();	// somersault: view goes down first
 	case EFidelisDiveDirection::Backward:	return FRotator(Angle, 0.f, 0.f).Quaternion();	// backward roll: view goes up first
-	case EFidelisDiveDirection::Right:		return FRotator(0.f, 0.f, Angle).Quaternion();	// barrel roll to the right
-	case EFidelisDiveDirection::Left:		return FRotator(0.f, 0.f, -Angle).Quaternion();
+	// Barrel rolls: end on RollEndLean (a little short of a full turn) when the standing slide follows.
+	case EFidelisDiveDirection::Right:		return FRotator(0.f, 0.f, Angle + RollEndLean * Ease).Quaternion();	// barrel roll to the right
+	case EFidelisDiveDirection::Left:		return FRotator(0.f, 0.f, -Angle + RollEndLean * Ease).Quaternion();
 	default:								return FQuat::Identity;
 	}
 }
@@ -470,8 +620,8 @@ FQuat UDiveComponent::GetRollViewRotation() const
 void UDiveComponent::UpdateDiveView(float DeltaTime)
 {
 	// Lying on the belly or the side: crawling sideways turns the body (view and rifle tilt) to the
-	// crawl side. Not on the back (that one turns over with the view instead).
-	if (State == EFidelisDiveState::Prone && DiveDir != EFidelisDiveDirection::Backward)
+	// crawl side. Not after a backward dive (that one turns over with the view instead).
+	if (State == EFidelisDiveState::Prone && DiveDir != EFidelisDiveDirection::Backward && !bProneFromBack)
 	{
 		if (const ACharacter* CrawlChar = Character.Get())
 		{
@@ -552,27 +702,99 @@ void UDiveComponent::UpdateDiveView(float DeltaTime)
 		HandsReachAlpha = 0.f;
 	}
 
-	// On the back: the body stays put while the view turns; looking far enough away from the feet
-	// rolls the character over onto the belly.
-	//    Turning back towards the feet rolls it onto the back again (a few degrees of margin so it
-	//    doesn't flicker right at the limit).
-	if (State == EFidelisDiveState::Prone && bProneFromBack && BackToBellyTurnAngle > 0.f)
+	// After a backward dive: the body stays put while the view turns, and rolls around its length to
+	// follow it: on the back looking at the feet, on the left / right flank looking 90 degrees to that
+	// side (view and rifle tilted that way), on the belly looking away from the feet.
+	//    A few degrees of margin around each limit so it doesn't flicker right on it.
+	if (State == EFidelisDiveState::Prone && bProneFromBack)
 	{
 		const ACharacter* Char = Character.Get();
 		const AController* Controller = Char ? Char->GetController() : nullptr;
 		const float ViewYaw = Controller ? Controller->GetControlRotation().Yaw : BackBodyYaw;
-		const float AwayFromFeet = FMath::Abs(FMath::FindDeltaAngleDegrees(BackBodyYaw, ViewYaw));
+		// On the back, moving towards the feet (where the view looks): turn over onto the belly to crawl
+		// that way, the feet going back behind.
+		if (DiveDir == EFidelisDiveDirection::Backward)
+		{
+			const UCharacterMovementComponent* CrawlMove = Movement.Get();
+			const FVector Accel = CrawlMove ? CrawlMove->GetCurrentAcceleration().GetSafeNormal2D() : FVector::ZeroVector;
+			if (FVector::DotProduct(Accel, FRotator(0.f, ViewYaw, 0.f).Vector()) > 0.5f)
+			{
+				// Side the legs sweep round to behind:
+				//  1) the side the move leans to (diagonal forward-left / forward-right),
+				//  2) else the side the feet already are on in the view (view turned right of the feet ->
+				//     feet on the left -> they go round by the left, the short way),
+				//  3) else (looking straight at them) the other side from last time.
+				const float SideMove = FRotator(0.f, ViewYaw, 0.f).UnrotateVector(Accel).Y;
+				const float FeetTurn = FMath::FindDeltaAngleDegrees(BackBodyYaw, ViewYaw);
+				TurnOverSign = SideMove > 0.1f ? 1.f
+					: SideMove < -0.1f ? -1.f
+					: FeetTurn > 2.f ? -1.f
+					: FeetTurn < -2.f ? 1.f
+					: -TurnOverSign;
+				TurnOverStartYaw = BackBodyYaw;
+				TurnOverElapsed = TurnOverToCrawlDuration > 0.f ? 0.f : -1.f;
+				BackBodyYaw = FRotator::NormalizeAxis(ViewYaw + 180.f);
+				UE_LOG(LogFidelis, Log, TEXT("Dive: avance vers les pieds -> se retourne pour ramper."));
+			}
+		}
+		// Negative = view turned left of the feet.
+		const float Turn = FMath::FindDeltaAngleDegrees(BackBodyYaw, ViewYaw);
+		const float Away = FMath::Abs(Turn);
+		constexpr float Margin = 5.f;
 		const bool bOnBack = DiveDir == EFidelisDiveDirection::Backward;
-		if (bOnBack && AwayFromFeet >= BackToBellyTurnAngle)
+		const bool bOnBelly = DiveDir == EFidelisDiveDirection::Forward;
+		const bool bBellyAllowed = BackToBellyTurnAngle > 0.f;
+		const float SideAngle = BackToSideTurnAngle > 0.f ? BackToSideTurnAngle : 1000.f;
+		const float BellyAngle = bBellyAllowed ? BackToBellyTurnAngle : 1000.f;
+
+		EFidelisDiveDirection Wanted;
+		if (Away >= BellyAngle + (bOnBelly ? -Margin : Margin))
 		{
-			DiveDir = EFidelisDiveDirection::Forward;
-			UE_LOG(LogFidelis, Log, TEXT("Dive: demi-tour sur le dos -> allonge sur le ventre."));
+			Wanted = EFidelisDiveDirection::Forward;
 		}
-		else if (!bOnBack && AwayFromFeet < FMath::Max(BackToBellyTurnAngle - 10.f, 0.f))
+		else if (Away >= SideAngle + (bOnBack ? Margin : -Margin))
 		{
-			DiveDir = EFidelisDiveDirection::Backward;
-			UE_LOG(LogFidelis, Log, TEXT("Dive: demi-tour sur le ventre -> allonge sur le dos."));
+			Wanted = Turn < 0.f ? EFidelisDiveDirection::Left : EFidelisDiveDirection::Right;
 		}
+		else
+		{
+			Wanted = EFidelisDiveDirection::Backward;
+		}
+		if (Wanted != DiveDir)
+		{
+			DiveDir = Wanted;
+			// Roll over smoothly from the current tilt (same easing as rolling over while crawling).
+			SideSwitchElapsed = 0.f;
+			SideSwitchStartRoll = CurrentViewRoll;
+			SideSwitchStartCant = CurrentWeaponCant;
+			UE_LOG(LogFidelis, Log, TEXT("Dive: vue a %.0f deg des pieds -> allonge %s."), Turn,
+				Wanted == EFidelisDiveDirection::Backward ? TEXT("sur le dos")
+				: Wanted == EFidelisDiveDirection::Left ? TEXT("sur le flanc gauche")
+				: Wanted == EFidelisDiveDirection::Right ? TEXT("sur le flanc droit") : TEXT("sur le ventre"));
+		}
+
+		// Body roll for the legs: towards the side the view turned (belly: on from the flank it came from,
+		// so it never spins back through the back).
+		const float TargetBodyRoll = DiveDir == EFidelisDiveDirection::Backward ? 0.f
+			: DiveDir == EFidelisDiveDirection::Left ? -90.f
+			: DiveDir == EFidelisDiveDirection::Right ? 90.f
+			: (CurrentBodyRoll < 0.f ? -180.f : 180.f);
+		CurrentBodyRoll = FMath::FInterpTo(CurrentBodyRoll, TargetBodyRoll, DeltaTime, ViewRollInterpSpeed);
+
+		if (TurnOverElapsed >= 0.f)
+		{
+			TurnOverElapsed += DeltaTime;
+			if (TurnOverElapsed >= TurnOverToCrawlDuration || DiveDir != EFidelisDiveDirection::Forward)
+			{
+				TurnOverElapsed = -1.f;
+				CurrentBodyRoll = TurnOverSign * 180.f;
+			}
+		}
+	}
+	else
+	{
+		CurrentBodyRoll = 0.f;
+		TurnOverElapsed = -1.f;
 	}
 
 	UpdateBackLegs();
@@ -581,7 +803,11 @@ void UDiveComponent::UpdateDiveView(float DeltaTime)
 void UDiveComponent::UpdateBackLegs()
 {
 	ACharacter* Char = Character.Get();
-	const bool bShow = bShowLegsOnBack && IsOnBack() && Char;
+	// On the back, and on the flanks it rolls onto by turning the view (not on the belly: behind the view).
+	// Also while turning over from the back to crawl: the legs sweep round to behind.
+	const bool bTurningOver = TurnOverElapsed >= 0.f && TurnOverToCrawlDuration > 0.f;
+	const bool bShow = bShowLegsOnBack && Char && State == EFidelisDiveState::Prone && bProneFromBack
+		&& (DiveDir != EFidelisDiveDirection::Forward || bTurningOver);
 	if (!bShow)
 	{
 		if (BackLegsMesh && BackLegsMesh->IsVisible())
@@ -630,16 +856,30 @@ void UDiveComponent::UpdateBackLegs()
 	//   The body frame keeps the yaw of the landing (BackBodyYaw): turning the view doesn't drag the legs.
 	const UCapsuleComponent* Capsule = Char->GetCapsuleComponent();
 	const float HalfHeight = Capsule ? Capsule->GetUnscaledCapsuleHalfHeight() : 34.f;
-	const FTransform BodyXf(FRotator(0.f, BackBodyYaw, 0.f), Char->GetActorLocation());
+	// Turning over to crawl: the body pivots on the ground (feet sweeping from in front to behind, on the
+	// TurnOverSign side) while rolling from the back onto the belly. Eased: slow start, slow end.
+	float LegsYaw = BackBodyYaw;
+	float LegsRoll = CurrentBodyRoll;
+	if (bTurningOver)
+	{
+		const float E = FMath::SmoothStep(0.f, 1.f, FMath::Clamp(TurnOverElapsed / TurnOverToCrawlDuration, 0.f, 1.f));
+		LegsYaw = TurnOverStartYaw + TurnOverSign * 180.f * E;
+		LegsRoll = TurnOverSign * 180.f * E;
+	}
+	const FTransform BodyXf(FRotator(0.f, LegsYaw, 0.f), Char->GetActorLocation());
 	float EyeX = 0.f;
 	if (const APlayerController* PC = Cast<APlayerController>(Char->GetController()); PC && PC->PlayerCameraManager)
 	{
 		EyeX = BodyXf.InverseTransformPosition(PC->PlayerCameraManager->GetCameraLocation()).X;
 	}
 	const FQuat LyingRot = FRotationMatrix::MakeFromYZ(FVector::UpVector, -FVector::ForwardVector).ToQuat();
+	// On a flank: the body rolled around its length (CurrentBodyRoll -90 = left side down, chest towards
+	// the left, where the view turned). Chest is +Z here; a quaternion angle of +90 about X takes it to -Y
+	// (left), hence the minus.
+	const FQuat BodyRollRot(FVector::ForwardVector, FMath::DegreesToRadians(-LegsRoll));
 	BackLegsMesh->SetWorldLocationAndRotation(
 		BodyXf.TransformPosition(FVector(EyeX + LegsDistanceFromEye, 0.f, -HalfHeight + LegsHeightAboveGround)),
-		BodyXf.GetRotation() * LyingRot);
+		BodyXf.GetRotation() * BodyRollRot * LyingRot);
 	if (!BackLegsMesh->IsVisible())
 	{
 		BackLegsMesh->SetVisibility(true);
@@ -670,6 +910,7 @@ void UDiveComponent::StartRoll()
 	RollElapsed = 0.f;
 	bRollQueued = false;
 	RollBaseDirection = DiveDirection;
+	RollEndLean = 0.f;
 	RollStartYaw = Char->GetControlRotation().Yaw;
 	State = EFidelisDiveState::Rolling;
 
@@ -741,5 +982,6 @@ void UDiveComponent::EndRoll(const TCHAR* Reason)
 	RestoreMovementSettings();
 	State = EFidelisDiveState::None;
 	LastStandTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	LastRollEndTime = LastStandTime;
 	UE_LOG(LogFidelis, Log, TEXT("Dive: fin de roulade (%s) apres %.2f s."), Reason, RollElapsed);
 }

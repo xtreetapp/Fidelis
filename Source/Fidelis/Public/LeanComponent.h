@@ -100,7 +100,7 @@ public:
 	/** Time for the view to go down when crouching (crouch key held, not running) (s). 0 = uses
 	 *  CrouchViewInterpSpeed like the rest. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crouch", meta = (ClampMin = 0))
-	float CrouchDownDuration = 0.25f;
+	float CrouchDownDuration = 0.2f;
 
 	/** Speed of the view going down / back up. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crouch", meta = (ClampMin = 0))
@@ -158,9 +158,42 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprint Pose")
 	TArray<FName> SprintVisibleBones = { TEXT("clavicle_r") };
 
-	/** Blend speed into / out of the sprint pose. */
+	/** Bones always hidden (with their children) on the first-person arms: the arms mesh is a full body,
+	 *  and when it tilts (hands out in a dive, lying down) its head comes in front of the camera. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprint Pose")
+	TArray<FName> FirstPersonHiddenBones = { TEXT("head") };
+
+	// ---- Climbing onto a ledge (BunnyHopComponent ledge grab) ----
+
+	/** Both hands grab the top of the wall while climbing onto a ledge (IK on the first-person arms). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ledge Grab")
+	bool bMantleHands = true;
+
+	/** In the air (jumps, falls): the arms animation is paused, holding the take-off walking pose (view,
+	 *  arms and rifle exactly as walking), instead of its jump / fall pose that moves the whole upper body. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Air")
+	bool bKeepGroundArmPoseInAir = true;
+
+	/** Gap between the two hands on the edge (cm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ledge Grab", meta = (ClampMin = 0))
+	float MantleHandSpacing = 45.f;
+
+	/** Wrist position relative to the middle of the edge (cm): X = over the top (past the edge),
+	 *  Z = above the top surface. The palm and fingers lie on the top from there. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ledge Grab")
+	FVector MantleWristOffset = FVector(2.f, 0.f, 5.f);
+
+	/** Elbows pushed out / down while hanging (cm, from where the animation has them). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Ledge Grab")
+	FVector2D MantleElbowOffset = FVector2D(25.f, -20.f);
+
+	/** Time to raise the rifle into the sprint pose (s, eased in and out). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprint Pose", meta = (ClampMin = 0))
-	float SprintPoseInterpSpeed = 9.f;
+	float SprintPoseRaiseDuration = 0.3f;
+
+	/** Time to lower the rifle out of the sprint pose (s, eased in and out). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprint Pose", meta = (ClampMin = 0))
+	float SprintPoseLowerDuration = 0.27f;
 
 	/** Current sprint pose blend, 0..1. */
 	UFUNCTION(BlueprintPure, Category = "Sprint Pose")
@@ -233,9 +266,29 @@ private:
 
 	float AimAlpha = 0.f;
 	float SprintPoseAlpha = 0.f;
+	/** Linear progress of the sprint pose blend (0..1), eased into SprintPoseAlpha. */
+	float SprintPoseProgress = 0.f;
 	float SprintBobPhase = 0.f;
 	bool bLeftArmHidden = false;
 	void SetLeftArmHidden(bool bHidden);
+	/** Hides FirstPersonHiddenBones on the arms once their mesh is ready. */
+	void HideFirstPersonBones();
+	bool bFirstPersonBonesHidden = false;
+	/** Climbing onto a ledge: puts both hands on the edge (two-bone IK on the rendered arms pose) and
+	 *  hides the rifle meanwhile. Rebuilt from the animated local pose, so it can run more than once a frame. */
+	void ApplyMantleHandsIK();
+	/** Air: pause the arms animation (holds the take-off walking pose). */
+	void ApplyAirArmPose();
+	/** When the last jump was pressed (world time): the arms animation is paused from that moment. */
+	double AirPauseRequestTime = -100.0;
+public:
+	/** Jump pressed: pause the arms animation right away, before the jump even starts, so the animation
+	 *  never sees a single frame in the air (bunny hops land and take off again within a frame or two). */
+	void NotifyJumpPressed();
+private:
+	float AirArmAlpha = 0.f;
+	bool bAirArmWanted = false;
+	bool bWeaponHiddenForMantle = false;
 	/** Writes the sprint visibility mask into the arms' bone visibility (both buffers). */
 	void ApplySprintBoneMask();
 	/** Arms bone visibility before the sprint mask, restored afterwards. */

@@ -3,6 +3,8 @@
 #include "HAL/IConsoleManager.h"
 
 #include "AK47Weapon.h"
+#include "BunnyHopComponent.h"
+#include "TwoBoneIK.h"
 #include "Fidelis.h"
 #include "Camera/CameraComponent.h"
 #include "CollisionQueryParams.h"
@@ -16,6 +18,7 @@
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedPlayerInput.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "InputAction.h"
 
@@ -359,6 +362,150 @@ void ULeanComponent::SetLeftArmHidden(bool bHidden)
 	UE_LOG(LogFidelis, Log, TEXT("Sprint: fusil %s."), bHidden ? TEXT("leve, seul le bras droit est visible") : TEXT("tenu a deux mains"));
 }
 
+void ULeanComponent::HideFirstPersonBones()
+{
+	USkeletalMeshComponent* Arms = Cast<USkeletalMeshComponent>(LeanTarget.Get());
+	if (bFirstPersonBonesHidden || !Arms || !Arms->GetSkinnedAsset() || Arms->GetNumBones() == 0)
+	{
+		return;
+	}
+	bFirstPersonBonesHidden = true;
+	for (const FName& Bone : FirstPersonHiddenBones)
+	{
+		if (Arms->GetBoneIndex(Bone) != INDEX_NONE)
+		{
+			// Visibility only: the bone (and the camera socket on it) keeps moving with the animation.
+			Arms->HideBoneByName(Bone, PBO_None);
+			UE_LOG(LogFidelis, Log, TEXT("Lean: os %s cache sur les bras %s."), *Bone.ToString(), *GetNameSafe(Arms));
+		}
+		else
+		{
+			UE_LOG(LogFidelis, Warning, TEXT("Lean: os %s introuvable sur %s."), *Bone.ToString(), *GetNameSafe(Arms));
+		}
+	}
+}
+
+void ULeanComponent::ApplyMantleHandsIK()
+{
+	USkeletalMeshComponent* Arms = Cast<USkeletalMeshComponent>(LeanTarget.Get());
+	const ACharacter* Char = Cast<ACharacter>(GetOwner());
+	const UBunnyHopComponent* Hop = Char ? Char->FindComponentByClass<UBunnyHopComponent>() : nullptr;
+	const float Alpha = (bMantleHands && Hop) ? Hop->GetMantleHandsAlpha() : 0.f;
+
+	// No rifle while the hands are on the ledge (it hangs from the right hand's animated socket).
+	if (const AAK47Weapon* Weapon = FindWeapon())
+	{
+		if (USkeletalMeshComponent* Gun = Weapon->GetFirstPersonMesh())
+		{
+			const bool bHide = Alpha > 0.f;
+			if (bHide != bWeaponHiddenForMantle)
+			{
+				Gun->SetVisibility(!bHide, true);
+				bWeaponHiddenForMantle = bHide;
+			}
+		}
+	}
+
+	FVector Edge;
+	FVector Forward;
+	if (Alpha <= 0.f || !Arms || !Arms->GetSkinnedAsset() || !Hop->GetLedgeGrip(Edge, Forward))
+	{
+		return;
+	}
+
+	// The rendered pose (read buffer, as the sprint mask does) and the animated local pose it came from.
+	TArray<FTransform>& Pose = const_cast<TArray<FTransform>&>(Arms->GetComponentSpaceTransforms());
+	const TArrayView<const FTransform> Locals = Arms->GetBoneSpaceTransformsView();
+	const int32 NumBones = Pose.Num();
+	if (Locals.Num() != NumBones || NumBones == 0)
+	{
+		return;
+	}
+	const FReferenceSkeleton& RefSkel = Arms->GetSkinnedAsset()->GetRefSkeleton();
+	const FTransform& CompXf = Arms->GetComponentTransform();
+	const FVector Up = FVector::UpVector;
+	const FVector Right(-Forward.Y, Forward.X, 0.f);
+	// Fingers over the edge, pointing a little down onto the top.
+	const FVector FingerDirCS = CompXf.InverseTransformVectorNoScale((Forward - Up * 0.25f).GetSafeNormal());
+
+	TArray<FTransform> Orig;
+	Orig.SetNum(NumBones);
+	TArray<bool> InArm;
+	for (int32 SideIndex = 0; SideIndex < 2; ++SideIndex)
+	{
+		const bool bLeft = SideIndex == 0;
+		const float Sign = bLeft ? -1.f : 1.f;
+		auto Bone = [Arms, bLeft](const TCHAR* Name)
+		{
+			return Arms->GetBoneIndex(FName(*FString::Printf(TEXT("%s_%s"), Name, bLeft ? TEXT("l") : TEXT("r"))));
+		};
+		const int32 UpperArm = Bone(TEXT("upperarm"));
+		const int32 LowerArm = Bone(TEXT("lowerarm"));
+		const int32 Hand = Bone(TEXT("hand"));
+		const int32 Middle = Bone(TEXT("middle_01"));
+		const int32 Index = Bone(TEXT("index_01"));
+		const int32 Pinky = Bone(TEXT("pinky_01"));
+		if (UpperArm <= 0 || LowerArm == INDEX_NONE || Hand == INDEX_NONE || Middle == INDEX_NONE
+			|| Index == INDEX_NONE || Pinky == INDEX_NONE
+			|| RefSkel.GetParentIndex(LowerArm) != UpperArm || RefSkel.GetParentIndex(Hand) != LowerArm)
+		{
+			continue;
+		}
+
+		// The arm as animated this frame, rebuilt from its local pose under the (untouched) shoulder.
+		InArm.Init(false, NumBones);
+		InArm[UpperArm] = true;
+		Orig[UpperArm] = Locals[UpperArm] * Pose[RefSkel.GetParentIndex(UpperArm)];
+		for (int32 i = UpperArm + 1; i < NumBones; ++i)
+		{
+			const int32 Parent = RefSkel.GetParentIndex(i);
+			if (Parent != INDEX_NONE && InArm[Parent])
+			{
+				InArm[i] = true;
+				Orig[i] = Locals[i] * Orig[Parent];
+			}
+		}
+
+		// Wrist on the edge, on this hand's side.
+		const FVector WristWorld = Edge + Right * (Sign * MantleHandSpacing * 0.5f + MantleWristOffset.Y * Sign)
+			+ Forward * MantleWristOffset.X + Up * MantleWristOffset.Z;
+		const FVector Effector = FMath::Lerp(Orig[Hand].GetLocation(), CompXf.InverseTransformPosition(WristWorld), Alpha);
+		const FVector ElbowHint = Orig[LowerArm].GetLocation()
+			+ CompXf.InverseTransformVectorNoScale(Right * Sign * MantleElbowOffset.X + Up * MantleElbowOffset.Y);
+
+		FTransform Root = Orig[UpperArm];
+		FTransform Joint = Orig[LowerArm];
+		FTransform End = Orig[Hand];
+		AnimationCore::SolveTwoBoneIK(Root, Joint, End, ElbowHint, Effector, /*bAllowStretching*/ false, 1.0, 1.0);
+
+		// Hand flat on the top: fingers over the edge, thumb towards the middle (index -> pinky outward).
+		const FTransform& H = Orig[Hand];
+		const FVector FingerLocal = H.InverseTransformVectorNoScale(Orig[Middle].GetLocation() - H.GetLocation());
+		const FVector AcrossLocal = H.InverseTransformVectorNoScale(Orig[Pinky].GetLocation() - Orig[Index].GetLocation());
+		const FVector AcrossCS = CompXf.InverseTransformVectorNoScale(Right * Sign);
+		if (!FingerLocal.IsNearlyZero() && !AcrossLocal.IsNearlyZero())
+		{
+			const FQuat Wanted = FRotationMatrix::MakeFromXY(FingerDirCS, AcrossCS).ToQuat()
+				* FRotationMatrix::MakeFromXY(FingerLocal, AcrossLocal).ToQuat().Inverse();
+			End.SetRotation(FQuat::Slerp(H.GetRotation(), Wanted, Alpha).GetNormalized());
+		}
+
+		// Write the arm back: the three solved bones, then everything hanging from them (twist bones,
+		// fingers) from their animated local pose.
+		Pose[UpperArm] = Root;
+		Pose[LowerArm] = Joint;
+		Pose[Hand] = End;
+		for (int32 i = UpperArm + 1; i < NumBones; ++i)
+		{
+			if (InArm[i] && i != LowerArm && i != Hand)
+			{
+				Pose[i] = Locals[i] * Pose[RefSkel.GetParentIndex(i)];
+			}
+		}
+	}
+	Arms->MarkRenderDynamicDataDirty();
+}
+
 void ULeanComponent::ApplySprintBoneMask()
 {
 	USkeletalMeshComponent* Arms = Cast<USkeletalMeshComponent>(LeanTarget.Get());
@@ -401,6 +548,37 @@ void ULeanComponent::OnArmsBonesFinalized()
 		ApplyOffset(CurrentOffset, -1.f);
 	}
 	ApplySprintBoneMask();
+	ApplyMantleHandsIK();
+}
+
+void ULeanComponent::NotifyJumpPressed()
+{
+	if (!bKeepGroundArmPoseInAir)
+	{
+		return;
+	}
+	AirPauseRequestTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	bAirArmWanted = true;
+	AirArmAlpha = 1.f;
+	ApplyAirArmPose();
+}
+
+void ULeanComponent::ApplyAirArmPose()
+{
+	// The arms play a third-person rifle animation whose jump / fall states move the whole upper body
+	// (head and camera included) and swing the rifle. In the air, pause that animation: the engine keeps
+	// the exact walking pose of the take-off (rifle attached as usual). The animation never sees the
+	// jump, so it doesn't play a landing either when it resumes on the ground.
+	USkeletalMeshComponent* Arms = Cast<USkeletalMeshComponent>(LeanTarget.Get());
+	if (!Arms)
+	{
+		return;
+	}
+	const bool bPause = bKeepGroundArmPoseInAir && bAirArmWanted;
+	if (Arms->bPauseAnims != bPause)
+	{
+		Arms->bPauseAnims = bPause;
+	}
 }
 
 void ULeanComponent::ApplyOffset(float Offset, float DeltaTime)
@@ -500,6 +678,12 @@ void ULeanComponent::ApplyOffset(float Offset, float DeltaTime)
 		{
 			SeenCrouchEndTime = StandSlide->GetLastCrouchEndTime();
 			StandUpStartDrop = CurrentCrouchDrop;
+		}
+		// Standing slide after a roll: the view rises from the roll's height to standing in one go, over
+		// the whole slide (straight again at its end).
+		if (StandSlide && StandSlide->IsStandingSlideFromRoll())
+		{
+			StandAlpha = FMath::Min(StandAlpha, StandSlide->GetSlideProgress());
 		}
 		if (StandSlide && !StandSlide->IsSliding() && !(StandDive && StandDive->IsBusy()))
 		{
@@ -662,9 +846,14 @@ void ULeanComponent::ApplyOffset(float Offset, float DeltaTime)
 
 	// 2c) Dive roll: the arms turn with the view (the camera itself is turned by UDiveCameraModifier),
 	//     pivoting on the eye so they stay in front of it the whole way round.
-	if (DiveComp)
+	const UBunnyHopComponent* RollHop = Char ? Char->FindComponentByClass<UBunnyHopComponent>() : nullptr;
+	const USlideComponent* LeanSlide = Char ? Char->FindComponentByClass<USlideComponent>() : nullptr;
+	if (DiveComp || RollHop || LeanSlide)
 	{
-		const FQuat RollLocal = DiveComp->GetRollViewRotation();
+		// Dive roll, air roll after a wall jump and slide-after-roll lean (same product as UDiveCameraModifier).
+		const FQuat RollLocal = (DiveComp ? DiveComp->GetRollViewRotation() : FQuat::Identity)
+			* (RollHop ? RollHop->GetAirRollViewRotation() : FQuat::Identity)
+			* (LeanSlide ? LeanSlide->GetRecoveryLeanViewRotation() : FQuat::Identity);
 		if (!RollLocal.Equals(FQuat::Identity, 1.e-4f))
 		{
 			const FQuat RollWorld = ViewQuat * RollLocal * ViewQuat.Inverse();
@@ -755,23 +944,61 @@ void ULeanComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 		const ACharacter* SprintChar = Cast<ACharacter>(GetOwner());
 		const USlideComponent* Slide = SprintChar ? SprintChar->FindComponentByClass<USlideComponent>() : nullptr;
 		const AAK47Weapon* PoseWeapon = FindWeapon();
+		// Climbing onto a ledge: both hands are needed, no sprint pose at all (not even fading out).
+		const UBunnyHopComponent* MantleHop = SprintChar ? SprintChar->FindComponentByClass<UBunnyHopComponent>() : nullptr;
+		const bool bMantling = MantleHop && MantleHop->IsMantling();
+		// Movement keys released: the rifle comes down right away, as the character stops (the run itself
+		// only ends a moment later, so quick direction changes don't cut it).
+		const UCharacterMovementComponent* PoseCMC = SprintChar ? SprintChar->GetCharacterMovement() : nullptr;
+		const bool bMoveInput = !PoseCMC || PoseCMC->IsFalling() || !PoseCMC->GetCurrentAcceleration().IsNearlyZero();
 		const bool bSprintingPose = bSprintPose && Slide && Slide->IsSprinting() && !Slide->IsSliding()
-			&& !(PoseWeapon && PoseWeapon->IsAiming());
+			&& !(PoseWeapon && PoseWeapon->IsAiming()) && !bMantling && bMoveInput;
 		const float SprintTarget = bSprintingPose ? 1.f : 0.f;
-		SprintPoseAlpha = FMath::FInterpTo(SprintPoseAlpha, SprintTarget, DeltaTime, SprintPoseInterpSpeed);
-		if (FMath::Abs(SprintPoseAlpha - SprintTarget) < 0.005f)
+		// Timed, eased both ways (slow start, slow end): the rifle comes up / down in one smooth motion,
+		// instead of an exponential blend that jumps at the start.
+		if (bMantling)
 		{
-			SprintPoseAlpha = SprintTarget;
+			SprintPoseProgress = 0.f;
 		}
+		else
+		{
+			const float Duration = SprintTarget > SprintPoseProgress ? SprintPoseRaiseDuration : SprintPoseLowerDuration;
+			SprintPoseProgress = Duration > 0.f
+				? FMath::FInterpConstantTo(SprintPoseProgress, SprintTarget, DeltaTime, 1.f / Duration) : SprintTarget;
+		}
+		SprintPoseAlpha = FMath::SmoothStep(0.f, 1.f, SprintPoseProgress);
 		// Running rhythm for the raised rifle: one full cycle per stride.
 		if (const ACharacter* BobChar = Cast<ACharacter>(GetOwner()))
 		{
 			SprintBobPhase = FMath::Fmod(SprintBobPhase + BobChar->GetVelocity().Size2D() * DeltaTime / SprintStrideLength * UE_TWO_PI, UE_TWO_PI);
 		}
 
+		// In the air: blend the left arm towards its walking grip (applied in ApplyAirArmPose).
+		{
+			const UCharacterMovementComponent* AirCMC = SprintChar ? SprintChar->GetCharacterMovement() : nullptr;
+			const UDiveComponent* AirDive = SprintChar ? SprintChar->FindComponentByClass<UDiveComponent>() : nullptr;
+			// In the air, or a jump just pressed (the take-off happens a frame later).
+			const bool bJumpJustPressed = GetWorld() && GetWorld()->GetTimeSeconds() - AirPauseRequestTime < 0.15;
+			bAirArmWanted = bKeepGroundArmPoseInAir && AirCMC && (AirCMC->IsFalling() || bJumpJustPressed)
+				&& !bMantling && !(AirDive && AirDive->IsBusy());
+			// Taking off: straight to the walking pose (it is the current pose at that moment), so none of
+			// the jump animation shows; landing: blend back smoothly.
+			AirArmAlpha = bAirArmWanted ? 1.f : 0.f;
+			ApplyAirArmPose();
+			if (!bAirArmWanted && AirArmAlpha < 0.005f)
+			{
+				AirArmAlpha = 0.f;
+			}
+		}
+		// Before any sprint mask, so the visibility it saves and restores already has these bones hidden.
+		if (!bLeftArmHidden)
+		{
+			HideFirstPersonBones();
+		}
 		// The left hand lets go early in the raise and grabs the rifle again late in the lowering.
 		SetLeftArmHidden(SprintPoseAlpha > 0.05f);
 		ApplySprintBoneMask();
+		ApplyMantleHandsIK();
 	}
 
 	// Aim down sights blend (RMB on the AK-47).
@@ -791,4 +1018,5 @@ void ULeanComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorC
 	// Re-applied every frame: the pose follows where the player looks and the crouch height.
 	ApplyOffset(CurrentOffset, DeltaTime);
 	bHasTicked = true;
+
 }

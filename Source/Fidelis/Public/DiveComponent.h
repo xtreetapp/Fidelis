@@ -33,8 +33,9 @@ enum class EFidelisDiveDirection : uint8
 /**
  * Omnidirectional dive: while running (in any direction, backwards included), press the dive key
  * (IA_Dive) to dive in the direction you are moving: forward, sideways or backward.
- * The character stays lying down as long as the key is held and stands up as soon as it is released.
- * Not running: the same key lies the character down on the spot (bProneInPlace).
+ * The dive always ends fully lying down (bAlwaysLandProne): with the dive key released, the character
+ * gets back up on its own after ProneAfterDiveTime; with the key held, it stays down until it is released.
+ * Not running: the same key lies the character down on the spot while it is held (bProneInPlace).
  * View per direction: forward = hands thrown forward to catch the fall, sideways = the view tilts
  * to that side, backward = lands on the back with the legs visible in front of the camera.
  * (The arms pose and the view tilt are applied by the LeanComponent, which owns the first-person view.)
@@ -55,6 +56,10 @@ public:
 
 	/** Time the character last got back up from a dive (prone or roll), in world seconds. */
 	double GetLastStandTime() const { return LastStandTime; }
+	/** When the last roll ended on its feet (world time). */
+	double GetLastRollEndTime() const { return LastRollEndTime; }
+	/** View roll (degrees, view-space roll) the current / last roll ends on (0 = level). */
+	float GetRollEndLean() const { return RollEndLean; }
 
 	/** Getting back up after lying down / rolling: 0 = just started, 1 = back on its feet. */
 	float GetStandUpAlpha() const;
@@ -98,6 +103,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions")
 	bool bRequireSprint = true;
 
+	/** A dive always lands fully lying down, even with the dive key released in the air: the character
+	 *  then gets back up on its own after ProneAfterDiveTime (held key: stays down until released).
+	 *  Off: the dive only ends lying down if the key is still held on landing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions")
+	bool bAlwaysLandProne = true;
+
+	/** Dive key released: time lying still once the belly slide has slowed down to crawl speed, before
+	 *  getting back up on its own (s). Standing up while still sliding fast would stop the body dead. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions", meta = (ClampMin = 0, EditCondition = "bAlwaysLandProne"))
+	float ProneAfterDiveTime = 0.2f;
+
 	/** Dive key pressed while NOT running: lie down on the spot (stays down while the key is held). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions")
 	bool bProneInPlace = true;
@@ -109,7 +125,7 @@ public:
 	/** Time taken to get back up after lying down or rolling (s): the view rises over it and the
 	 *  character can't run until it is over. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions", meta = (ClampMin = 0))
-	float StandUpDuration = 0.25f;
+	float StandUpDuration = 0.45f;
 
 	/** Delay after standing up before another dive (s). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Conditions", meta = (ClampMin = 0))
@@ -155,6 +171,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Launch", meta = (ClampMin = 0, ClampMax = 1))
 	float DiveAirControl = 0.f;
 
+	/** The air braking (character's BrakingDecelerationFalling) never takes the dive's horizontal speed
+	 *  below this (cm/s): a dive from a height keeps moving forward instead of dropping straight down.
+	 *  Shorter dives (landing faster than this) are unchanged. 0 = off. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Launch", meta = (ClampMin = 0))
+	float DiveMinAirSpeed = 656.f;
 	/** Capsule half height while lying down (cm). Clamped to the capsule radius. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Prone", meta = (ClampMin = 0))
 	float ProneHalfHeight = 34.f;
@@ -187,10 +208,21 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll", meta = (ClampMin = 0, EditCondition = "bRollTurnsView"))
 	float RollViewTurns = 1.f;
 
+	/** When the roll turns fastest, as a fraction of the roll (0.5 = in the middle, small = right at the
+	 *  start). The turning speed builds up to that moment, then slows down to 0 at the end. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll", meta = (ClampMin = 0.01, ClampMax = 0.99, EditCondition = "bRollTurnsView"))
+	float RollViewPeakTime = 0.15f;
+
+	/** Side dive roll followed by a slide (standing or crouched): the roll stops turning short of level,
+	 *  leaning to the side opposite to where it started, by the dive's view tilt (SideDiveRollAngle); the
+	 *  slide then straightens up. Not when the dive key is held (lying down). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll", meta = (EditCondition = "bRollTurnsView"))
+	bool bRollEndsLeaning = true;
+
 	/** The roll starts at the speed the dive lands with (if faster than RollStartSpeed), so landing
 	 *  doesn't brake the character. The dive itself always keeps its full trajectory. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll")
-	bool bRollKeepsLandingSpeed = true;
+	bool bRollKeepsLandingSpeed = false;
 
 	/** Duration of the roll (s). When > 0, the roll lasts exactly this long (speed going from the start
 	 *  speed to RollEndSpeed) and RollDistance is ignored. */
@@ -203,11 +235,11 @@ public:
 
 	/** Speed at the start of the roll (cm/s). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll", meta = (ClampMin = 0))
-	float RollStartSpeed = 850.f;
+	float RollStartSpeed = 881.f;
 
 	/** Speed at the end of the roll (cm/s), before standing up. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|Roll", meta = (ClampMin = 0))
-	float RollEndSpeed = 300.f;
+	float RollEndSpeed = 881.f;
 
 	/** Steering during the roll: turning the view left / right bends the roll the same way, up to this
 	 *  angle from its starting direction (degrees). 0 = straight roll. */
@@ -292,10 +324,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|View|Back")
 	float LegsHeightAboveGround = 10.f;
 
-	/** Lying on the back, turning the view this far away from the feet (degrees) rolls the character
-	 *  over onto the belly; turning back towards the feet rolls it onto the back again. 0 = never rolls over. */
+	/** Lying down (whatever the dive), the body keeps its orientation and the view turning away from it
+	 *  rolls it over: 90 degrees -> on a flank, 180 -> belly <-> back (feet in view on the back).
+	 *  Off: only after a backward dive; otherwise crawling sideways picks the flank. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|View|Back")
+	bool bProneBodyFollowsView = true;
+
+	/** On the back, moving towards the feet turns the character over onto the belly to crawl: time of that
+	 *  turn (s), the legs sweeping round to behind while the body rolls over. 0 = instant. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|View|Back", meta = (ClampMin = 0))
+	float TurnOverToCrawlDuration = 0.4f;
+
+	/** Lying on the back, turning the view this far left / right away from the feet (degrees) rolls the
+	 *  character onto that flank (view and rifle tilted to that side, like after a side dive). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|View|Back", meta = (ClampMin = 0, ClampMax = 180))
-	float BackToBellyTurnAngle = 90.f;
+	float BackToSideTurnAngle = 45.f;
+
+	/** Lying on the back, turning the view this far away from the feet (degrees) rolls the character
+	 *  over onto the belly; turning back towards the feet rolls it onto its flank, then its back again.
+	 *  0 = never rolls over (stays on the back whatever the view). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dive|View|Back", meta = (ClampMin = 0, ClampMax = 180))
+	float BackToBellyTurnAngle = 135.f;
 
 protected:
 	virtual void BeginPlay() override;
@@ -329,6 +378,10 @@ private:
 	bool bDiveWasHeld = false;
 	bool bMoveLocked = false;
 	bool bCrouchWasHeld = false;
+	/** Lying down after a dive with the key released: gets back up on its own at ProneAutoStandTime. */
+	bool bProneAutoStand = false;
+	double ProneAutoStandTime = -1.0;	// < 0: the belly slide is not over yet
+	double ProneLandTime = 0.0;
 	bool bRollQueued = false;
 	float RollSpeedAtStart = 850.f;
 	FVector DiveDirection = FVector::ForwardVector;
@@ -347,6 +400,24 @@ private:
 	float RollStartYaw = 0.f;
 	/** Lying down after a backward dive: can roll between back and belly by turning the view. */
 	bool bProneFromBack = false;
+	/** Lying down after a backward dive: body roll around its length (0 = on the back, -90 = left
+	 *  flank, +90 = right flank, 180 = belly), applied to the legs shown to the player. */
+	float CurrentBodyRoll = 0.f;
+	/** Lying down from a side slide: the slide carries on lying down, with the slide's own speed curve
+	 *  (current speed -> the slide's end speed over the slide's time left). */
+	float ProneSlideTimeLeft = 0.f;
+	float ProneSlideElapsed = 0.f;
+	float ProneSlideStartSpeed = 0.f;
+	/** Time into the slide when lying down: the lying slide carries on along the slide's speed curve. */
+	float ProneSlideFromElapsed = 0.f;
+	TWeakObjectPtr<class USlideComponent> ProneSlideSource;
+	float ProneSlideEndSpeed = 0.f;
+	FVector ProneSlideDir = FVector::ForwardVector;
+	void EndProneSlide(const TCHAR* Reason);
+	/** Turning over from the back to crawl: elapsed time (-1 = none), legs yaw at the start, sweep side. */
+	float TurnOverElapsed = -1.f;
+	float TurnOverStartYaw = 0.f;
+	float TurnOverSign = 1.f;
 	float HandsReachAlpha = 0.f;
 
 	/** Legs-only copy of the body mesh, shown to the player while lying on the back. */
@@ -356,6 +427,9 @@ private:
 	float RollDuration = 0.f;
 	float AirTime = 0.f;
 	double LastStandTime = -100.0;
+	double LastRollEndTime = -100.0;
+	/** Lean the roll ends on (smoothed, follows the keys held during the roll). */
+	float RollEndLean = 0.f;
 
 	// Saved movement settings, restored when standing up.
 	float SavedCrouchedHalfHeight = 40.f;

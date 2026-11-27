@@ -3,6 +3,7 @@
 #include "Fidelis.h"
 #include "AK47Weapon.h"
 #include "DiveComponent.h"
+#include "BunnyHopComponent.h"
 #include "Engine/World.h"
 #include "EnhancedPlayerInput.h"
 #include "GameFramework/Character.h"
@@ -42,6 +43,11 @@ void USlideComponent::BeginPlay()
 			WalkSpeed = CMC->MaxWalkSpeed;
 			SavedGroundFriction = CMC->GroundFriction;
 			SavedBrakingDeceleration = CMC->BrakingDecelerationWalking;
+			if (CrouchSpeed > 0.f)
+			{
+				// Before anything saves it (slide, dive), so they all restore this value.
+				CMC->MaxWalkSpeedCrouched = CrouchSpeed;
+			}
 			CMC->GetNavAgentPropertiesRef().bCanCrouch = true;
 
 			// Our slide velocity must be written before the movement component integrates it.
@@ -126,6 +132,41 @@ void USlideComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
+	// Slide after a roll: side sway, smoothed so it never snaps when the slide is cut short.
+	{
+		const float Progress = GetSlideProgress();
+
+		// Side sway: starts straight, leans one way, then the other, dying down to straight at the end.
+		const float Envelope = 1.f - FMath::SmoothStep(0.f, 1.f, Progress);
+		if (IsSlideFromRoll() && !bSlideBraking)
+		{
+			// Lean the roll ended on, straightening up by the end of the slide (eased), plus the optional sway.
+			const float WantedSway = RecoveryStartRoll * Envelope
+				+ (IsStandingSlideFromRoll()
+					? RecoverySwaySign * RecoverySwayAngle * Envelope * FMath::Sin(2.f * PI * RecoverySwayCycles * Progress) : 0.f);
+			RecoverySwayRoll = DeltaTime > 0.f ? FMath::FInterpTo(RecoverySwayRoll, WantedSway, DeltaTime, 20.f) : WantedSway;
+			RecoveryReleaseElapsed = -1.f;
+		}
+		else if (RecoverySwayRoll != 0.f)
+		{
+			// Slide braked or cut short while still leaning: straighten up over RecoveryReleaseDuration,
+			// eased, instead of snapping back level.
+			if (RecoveryReleaseElapsed < 0.f)
+			{
+				RecoveryReleaseElapsed = 0.f;
+				RecoveryReleaseFrom = RecoverySwayRoll;
+			}
+			RecoveryReleaseElapsed += DeltaTime;
+			const float Alpha = RecoveryReleaseDuration > 0.f ? FMath::Clamp(RecoveryReleaseElapsed / RecoveryReleaseDuration, 0.f, 1.f) : 1.f;
+			RecoverySwayRoll = RecoveryReleaseFrom * (1.f - FMath::SmoothStep(0.f, 1.f, Alpha));
+			if (Alpha >= 1.f)
+			{
+				RecoverySwayRoll = 0.f;
+				RecoveryReleaseElapsed = -1.f;
+			}
+		}
+	}
+
 	ACharacter* Char = Character.Get();
 	UCharacterMovementComponent* CMC = Movement.Get();
 	APlayerController* PC = Char ? Cast<APlayerController>(Char->GetController()) : nullptr;
@@ -188,9 +229,20 @@ void USlideComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 		return;
 	}
 
+	// Running when leaving the ground (before aiming in the air cuts the run): the landing slide keeps
+	// the running speeds.
+	const bool bFallingNow = CMC->IsFalling();
+	if (bFallingNow && !bWasFalling)
+	{
+		bSprintAtTakeoff = bIsSprinting;
+	}
+	bWasFalling = bFallingNow;
+
 	// --- Sprint ---
 	const float GroundSpeed = CMC->Velocity.Size2D();
-	const bool bMoving = GroundSpeed > 10.f && !CMC->GetCurrentAcceleration().IsNearlyZero();
+	// In the air or climbing a ledge the movement keys are ignored (BunnyHopComponent): still moving.
+	const bool bMoving = (GroundSpeed > 10.f && (!CMC->GetCurrentAcceleration().IsNearlyZero() || CMC->IsFalling()))
+		|| CMC->IsFlying();
 	// No running while still getting back up after lying down / rolling.
 	const bool bStandingUp = (Dive && Dive->GetStandUpAlpha() < 1.f) || GetStandUpAlpha() < 1.f
 		|| GetCrouchStandUpAlpha() < 1.f;
@@ -206,14 +258,26 @@ void USlideComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 	const bool bAimingNow = bNoSprintWhileAiming && IsAiming();
 	if (bAimingNow && bIsSprinting)
 	{
+		// Aiming only pauses the run: it picks up again where it was once the aim is released.
+		bSprintPausedByAim = true;
+		PausedSprintElapsed = Now - SprintStartTime;
+		PausedSprintDistance = SprintDistance;
 		SetSprinting(false, TEXT("visee"));
+		LastSprintEndTime = -100.0;
 	}
-	if (bWasAiming && !bAimingNow && bMoving)
+	// Only a run the aim interrupted comes back (walking after the end of an auto run, aiming doesn't
+	// start a new one).
+	if (bWasAiming && !bAimingNow && bMoving && bSprintPausedByAim)
 	{
 		bSprintPendingAfterSlide = true;
 		SprintPendingSince = Now;
 	}
 	bWasAiming = bAimingNow;
+	// A real stop (or crouching) ends the paused run: the next one starts afresh.
+	if (bSprintPausedByAim && (!bStillMoving || bCrouchedByHold || CMC->IsCrouching()))
+	{
+		bSprintPausedByAim = false;
+	}
 	const bool bCanRun = bStillMoving && !bCrouchedByHold && !CMC->IsCrouching() && !bStandingUp && !bAimingNow;
 
 	if (bIsSprinting)
@@ -225,6 +289,9 @@ void USlideComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 	if (bIsSprinting && !bCanRun)
 	{
 		SetSprinting(false, TEXT("arret"));
+		// A stop (or aim, crouch...) isn't the end of a full auto run: no recharge, moving again runs
+		// straight away. Only a run that lasted its full auto duration / distance waits AutoSprintRecharge.
+		LastSprintEndTime = -100.0;
 	}
 	else if (bIsSprinting && bAutoSprint && !bSprintHeld && AutoSprintDuration > 0.f && Now - SprintStartTime >= AutoSprintDuration)
 	{
@@ -251,8 +318,44 @@ void USlideComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 
 	ApplyDirectionalSpeed();
 
-	// --- Crouch pressed while running -> slide ---
+	// --- Crouch pressed in the air -> slide on landing ---
 	const bool bCooldownOver = GetWorld()->GetTimeSeconds() - LastSlideEndTime >= SlideCooldown;
+	// --- Dive roll just ended on the ground -> standing slide, always (no key needed) ---
+	if (bSlideAfterRoll && Dive && CMC->IsMovingOnGround() && Dive->GetLastRollEndTime() != HandledRollEndTime
+		&& GetWorld()->GetTimeSeconds() - Dive->GetLastRollEndTime() < 0.2)
+	{
+		HandledRollEndTime = Dive->GetLastRollEndTime(); // once per roll
+		UE_LOG(LogFidelis, Log, TEXT("Slide: fin de roulade -> glissade %s."), bCrouchHeld ? TEXT("accroupie") : TEXT("debout"));
+		StartSlideFrom(Dive->RollEndSpeed, bCrouchHeld ? SlideAfterRollCrouchedDistance : SlideAfterRollDistance, bCrouchHeld);
+		return;
+	}
+	if (bSlideOnLanding && bCrouchPressed && CMC->IsFalling())
+	{
+		// This press is the wall-bounce air roll: after the roll, slide only if crouch is still held.
+		const UBunnyHopComponent* Hop = Char->FindComponentByClass<UBunnyHopComponent>();
+		bLandingSlideNeedsHold = Hop && Hop->IsAirRollReadyOrActive();
+		bLandingSlideQueued = !bLandingSlideNeedsHold || bSlideAfterRoll;
+		UE_LOG(LogFidelis, Log, TEXT("Slide: accroupi en l'air -> glissade a l'atterrissage%s."),
+			bLandingSlideNeedsHold ? TEXT(" si la touche reste maintenue (roulade)") : TEXT(""));
+	}
+	if (bLandingSlideQueued && CMC->IsMovingOnGround())
+	{
+		bLandingSlideQueued = false;
+		if (bLandingSlideNeedsHold && !bCrouchHeld)
+		{
+			UE_LOG(LogFidelis, Log, TEXT("Slide: roulade terminee sans maintenir accroupi -> pas de glissade."));
+		}
+		else if (bCooldownOver && GroundSpeed >= MinLandingSlideSpeed)
+		{
+			UE_LOG(LogFidelis, Log, TEXT("Slide: atterrissage en glissade (%.0f cm/s%s)."), GroundSpeed,
+				bSprintAtTakeoff ? TEXT(", vitesses de course") : TEXT(""));
+			// Took off running: running speeds even if aiming in the air stopped the run.
+			StartSlide(bSprintAtTakeoff ? SprintSpeed : 0.f);
+			return;
+		}
+	}
+
+	// --- Crouch pressed while running -> slide ---
 	if (bCrouchPressed && bIsSprinting && CMC->IsMovingOnGround() && bCooldownOver
 		&& GroundSpeed >= CMC->MaxWalkSpeed * MinSprintSpeedRatioToSlide)
 	{
@@ -303,8 +406,10 @@ void USlideComponent::SetSprinting(bool bSprint, const TCHAR* Reason)
 	}
 	if (bSprint)
 	{
-		SprintDistance = 0.f;
-		SprintStartTime = GetWorld()->GetTimeSeconds();
+		// Back from aiming: carry on with the same run (time / distance), otherwise a new run.
+		SprintDistance = bSprintPausedByAim ? PausedSprintDistance : 0.f;
+		SprintStartTime = GetWorld()->GetTimeSeconds() - (bSprintPausedByAim ? PausedSprintElapsed : 0.f);
+		bSprintPausedByAim = false;
 		LastSprintLocation = GetOwner()->GetActorLocation();
 	}
 	else
@@ -347,7 +452,20 @@ void USlideComponent::ApplyDirectionalSpeed()
 	CMC->MaxWalkSpeed = BaseSpeed * Multiplier;
 }
 
-void USlideComponent::StartSlide()
+float USlideComponent::GetSlideSpeedAt(float Elapsed) const
+{
+	const float Curve = FMath::Max(SlideSpeedCurve, 0.1f);
+	if (Elapsed < SlideFirstHalfDuration)
+	{
+		const float Progress = Elapsed / SlideFirstHalfDuration;
+		return SlideStartSpeed - (SlideStartSpeed - SlideMidSpeed) * FMath::Pow(Progress, Curve);
+	}
+	const float SecondDuration = SlideDuration - SlideFirstHalfDuration;
+	const float Progress = SecondDuration > 0.f ? FMath::Clamp((Elapsed - SlideFirstHalfDuration) / SecondDuration, 0.f, 1.f) : 1.f;
+	return SlideMidSpeed - (SlideMidSpeed - SlideEndSpeed) * FMath::Pow(Progress, FMath::Max(CurrentSecondHalfCurve, 0.1f));
+}
+
+void USlideComponent::StartSlide(float BaseSpeed)
 {
 	ACharacter* Char = Character.Get();
 	UCharacterMovementComponent* CMC = Movement.Get();
@@ -358,17 +476,93 @@ void USlideComponent::StartSlide()
 		SlideDirection = Char->GetActorForwardVector().GetSafeNormal2D();
 	}
 
-	// Relative to the running speed in the current direction (slower sideways / backward), set by
-	// ApplyDirectionalSpeed this tick, so side slides start 10% faster than running sideways.
-	SlideStartSpeed = CMC->MaxWalkSpeed * SlideSpeedMultiplier;
-
-	// Linear speed decay from Start to End: distance = average speed * duration.
-	const float AvgSpeed = FMath::Max((SlideStartSpeed + SlideEndSpeed) * 0.5f, 1.f);
+	// Two halves of the distance, each with its own average speed relative to the running speed in the
+	// current direction (set by ApplyDirectionalSpeed this tick). In each half the speed follows
+	// v(p) = Start - (Start - End) * p^n over p = 0..1, whose average is Start - (Start - End) / (n + 1):
+	// solve each half's start (peak) for its wanted average. Second half first: it ends at SlideEndSpeed;
+	// the first half ends where the second one starts.
+	const float Curve = FMath::Max(SlideSpeedCurve, 0.1f);
+	// BaseSpeed given (landing slide after a running jump): use it instead of the current speed cap.
+	const float Base = BaseSpeed > 0.f ? BaseSpeed : CMC->MaxWalkSpeed;
+	const float Avg1 = FMath::Max(Base * SlideFirstHalfSpeedMultiplier, 1.f);
+	const float Avg2 = FMath::Max(Base * SlideSecondHalfSpeedMultiplier, 1.f);
+	const float Curve2 = FMath::Max(SlideSecondHalfSpeedCurve, 0.1f);
+	SlideMidSpeed = FMath::Max(((Curve2 + 1.f) * Avg2 - SlideEndSpeed) / Curve2, Avg2);
+	SlideStartSpeed = FMath::Max(((Curve + 1.f) * Avg1 - SlideMidSpeed) / Curve, Avg1);
 	// Forward slide (within ~45 degrees of the view) goes further than a sideways / backward one.
 	const FVector LocalDir = FRotator(0.f, Char->GetControlRotation().Yaw, 0.f).UnrotateVector(SlideDirection);
 	const float Distance = LocalDir.X >= 0.7f ? SlideDistance : SlideDistanceSideBack;
-	SlideDuration = Distance / AvgSpeed;
+	// distance = average speed * duration, half the distance each.
+	SlideFirstHalfDuration = Distance * 0.5f / Avg1;
+	SlideDuration = SlideFirstHalfDuration + Distance * 0.5f / Avg2;
+	CurrentSecondHalfCurve = Curve2;
+	bSlideFromRoll = false;
+	BeginSlideMovement();
+
+	UE_LOG(LogFidelis, Log, TEXT("Slide: debut (vitesse %.0f -> %.0f a mi-distance -> %.0f, moyennes %.0f / %.0f, %.0f cm en %.2f s)."),
+		SlideStartSpeed, SlideMidSpeed, SlideEndSpeed, Avg1, Avg2, Distance, SlideDuration);
+}
+
+void USlideComponent::StartSlideFrom(float StartSpeed, float Distance, bool bCrouched)
+{
+	const ACharacter* Char = Character.Get();
+	const UCharacterMovementComponent* CMC = Movement.Get();
+	SlideDirection = CMC->Velocity.GetSafeNormal2D();
+	if (SlideDirection.IsNearlyZero())
+	{
+		SlideDirection = Char->GetActorForwardVector().GetSafeNormal2D();
+	}
+	// One steady slowdown: no first half, linear second half.
+	SlideStartSpeed = FMath::Max(StartSpeed, SlideEndSpeed);
+	SlideMidSpeed = SlideStartSpeed;
+	SlideFirstHalfDuration = 0.f;
+	CurrentSecondHalfCurve = 1.f;
+	SlideDuration = FMath::Max(Distance, 1.f) / FMath::Max((SlideStartSpeed + SlideEndSpeed) * 0.5f, 1.f);
+	bSlideFromRoll = true;
+	bSlideFromRollCrouched = bCrouched;
+	RecoveryStartRoll = 0.f; // StartSlideAfterRoll sets the roll's end lean right after
+	// First sway towards the side the slide drifts to (slightly off the view), else to the right.
+	{
+		const float Side = FRotator(0.f, Char->GetControlRotation().Yaw, 0.f).UnrotateVector(SlideDirection).Y;
+		RecoverySwaySign = Side < -0.2f ? -1.f : 1.f;
+	}
+	// Crouched, or standing (straightening up along the slide).
+	BeginSlideMovement(/*bCrouchDown*/ bCrouched);
+
+	UE_LOG(LogFidelis, Log, TEXT("Slide: debut apres roulade (%.0f -> %.0f cm/s, %.0f cm en %.2f s)."),
+		SlideStartSpeed, SlideEndSpeed, Distance, SlideDuration);
+}
+
+void USlideComponent::StartSlideAfterRoll(double RollEndTime, float Speed, float StartLeanRoll)
+{
+	if (!bSlideAfterRoll || bIsSliding || RollEndTime == HandledRollEndTime || !Character.IsValid() || !Movement.IsValid())
+	{
+		return;
+	}
+	HandledRollEndTime = RollEndTime;
+	// Crouch held at the end of the roll -> crouched slide, otherwise standing.
+	APlayerController* PC = Cast<APlayerController>(Character->GetController());
+	const bool bCrouched = PC && IsActionHeld(PC, CrouchAction);
+	UE_LOG(LogFidelis, Log, TEXT("Slide: fin de roulade -> glissade %s."), bCrouched ? TEXT("accroupie") : TEXT("debout"));
+	StartSlideFrom(Speed, bCrouched ? SlideAfterRollCrouchedDistance : SlideAfterRollDistance, bCrouched);
+	// Carry on exactly from the lean the roll ended on (no smoothing delay at the hand-off).
+	RecoveryStartRoll = StartLeanRoll;
+	RecoverySwayRoll = StartLeanRoll;
+	RecoveryReleaseElapsed = -1.f;
+}
+
+FQuat USlideComponent::GetRecoveryLeanViewRotation() const
+{
+	return RecoverySwayRoll != 0.f ? FRotator(0.f, 0.f, RecoverySwayRoll).Quaternion() : FQuat::Identity;
+}
+
+void USlideComponent::BeginSlideMovement(bool bCrouchDown)
+{
+	ACharacter* Char = Character.Get();
+	UCharacterMovementComponent* CMC = Movement.Get();
 	SlideElapsed = 0.f;
+	SlideTurnAngle = 0.f;
+	bSlideBraking = false;
 
 	bIsSliding = true;
 	bSprintPendingAfterSlide = false;
@@ -380,7 +574,13 @@ void USlideComponent::StartSlide()
 	CMC->MaxWalkSpeedCrouched = SlideStartSpeed;
 	CMC->GroundFriction = 0.f;
 	CMC->BrakingDecelerationWalking = 0.f;
-	Char->Crouch();
+	if (bCrouchDown)
+	{
+		Char->Crouch();
+		// Straight out of a roll the character is still crouched but the roll just asked to stand up:
+		// Crouch() is ignored while crouched, so keep the crouch request on directly.
+		CMC->bWantsToCrouch = true;
+	}
 
 	// Steering is locked during the slide; looking around still works.
 	if (AController* Controller = Char->GetController())
@@ -388,8 +588,6 @@ void USlideComponent::StartSlide()
 		Controller->SetIgnoreMoveInput(true);
 	}
 
-	UE_LOG(LogFidelis, Log, TEXT("Slide: debut (vitesse %.0f -> %.0f, %.0f cm en %.2f s)."),
-		SlideStartSpeed, SlideEndSpeed, Distance, SlideDuration);
 }
 
 void USlideComponent::TickSlide(float DeltaTime)
@@ -402,25 +600,98 @@ void USlideComponent::TickSlide(float DeltaTime)
 		return;
 	}
 
-	SlideElapsed += DeltaTime;
-	if (SlideElapsed >= SlideDuration)
+	// A movement key pushed against the slide direction: brake to a stop over a short distance instead
+	// of stopping dead (any slide).
+	if (!bSlideBraking && SlideBrakeDistance > 0.f)
 	{
-		EndSlide(TEXT("distance atteinte"));
-		return;
+		if (const ACharacter* Char = Character.Get())
+		{
+			const APlayerController* PC = Cast<APlayerController>(Char->GetController());
+			if (const UEnhancedPlayerInput* PlayerInput = PC && MoveAction ? Cast<UEnhancedPlayerInput>(PC->PlayerInput) : nullptr)
+			{
+				const FVector2D Move = PlayerInput->GetActionValue(MoveAction).Get<FVector2D>();
+				if (Move.SizeSquared() > 0.25f)
+				{
+					const FRotator YawRot(0.f, Char->GetControlRotation().Yaw, 0.f);
+					const FVector WishDir = (YawRot.RotateVector(FVector::ForwardVector) * Move.Y
+						+ YawRot.RotateVector(FVector::RightVector) * Move.X).GetSafeNormal2D();
+					if (FVector::DotProduct(WishDir, SlideDirection) < -0.5f)
+					{
+						bSlideBraking = true;
+						SlideBrakeElapsed = 0.f;
+						SlideBrakeStartSpeed = FMath::Max(FVector::DotProduct(CMC->Velocity, SlideDirection), 1.f);
+						// Steady slowdown to 0: distance = start speed / 2 * time.
+						SlideBrakeDuration = 2.f * SlideBrakeDistance / SlideBrakeStartSpeed;
+						UE_LOG(LogFidelis, Log, TEXT("Slide: touche opposee -> freinage (%.0f cm/s -> 0 sur %.0f cm, %.2f s)."),
+							SlideBrakeStartSpeed, SlideBrakeDistance, SlideBrakeDuration);
+					}
+				}
+			}
+		}
 	}
 
-	// Blocked by a wall: velocity collapsed after the previous move.
-	if (SlideElapsed > 0.1f && CMC->Velocity.Size2D() < SlideEndSpeed * 0.5f)
+	float Speed = 0.f;
+	if (bSlideBraking)
 	{
-		EndSlide(TEXT("obstacle"));
-		return;
+		SlideBrakeElapsed += DeltaTime;
+		if (SlideBrakeElapsed >= SlideBrakeDuration)
+		{
+			EndSlide(TEXT("freinage"));
+			return;
+		}
+		Speed = SlideBrakeStartSpeed * (1.f - SlideBrakeElapsed / SlideBrakeDuration);
+	}
+	else
+	{
+		SlideElapsed += DeltaTime;
+		if (SlideElapsed >= SlideDuration)
+		{
+			EndSlide(TEXT("distance atteinte"));
+			return;
+		}
+
+		// Blocked by a wall: velocity collapsed after the previous move.
+		if (SlideElapsed > 0.1f && CMC->Velocity.Size2D() < SlideEndSpeed * 0.5f)
+		{
+			EndSlide(TEXT("obstacle"));
+			return;
+		}
+		Speed = GetSlideSpeedAt(SlideElapsed);
 	}
 
-	const float Alpha = SlideElapsed / SlideDuration;
-	const float Speed = FMath::Lerp(SlideStartSpeed, SlideEndSpeed, Alpha);
+	// Steering: a movement key to the side of the slide (left / right on a forward slide, forward /
+	// back on a side slide...) turns it towards that key, up to SlideMaxTurnAngle from where it started.
+	// The move input itself is locked during the slide, so read the move action directly.
+	if (bSlideSteering && !bSlideBraking && SlideTurnRate > 0.f)
+	{
+		if (const ACharacter* Char = Character.Get())
+		{
+			const APlayerController* PC = Cast<APlayerController>(Char->GetController());
+			if (const UEnhancedPlayerInput* PlayerInput = PC && MoveAction ? Cast<UEnhancedPlayerInput>(PC->PlayerInput) : nullptr)
+			{
+				const FVector2D Move = PlayerInput->GetActionValue(MoveAction).Get<FVector2D>();
+				if (Move.SizeSquared() > 0.25f)
+				{
+					const FRotator YawRot(0.f, Char->GetControlRotation().Yaw, 0.f);
+					const FVector WishDir = (YawRot.RotateVector(FVector::ForwardVector) * Move.Y
+						+ YawRot.RotateVector(FVector::RightVector) * Move.X).GetSafeNormal2D();
+					// Signed angle from the slide direction to the key's direction (positive = to the right).
+					const float ToWish = FMath::RadiansToDegrees(FMath::Atan2(
+						FVector::CrossProduct(SlideDirection, WishDir).Z, FVector::DotProduct(SlideDirection, WishDir)));
+					const float Step = FMath::Clamp(ToWish, -SlideTurnRate * DeltaTime, SlideTurnRate * DeltaTime);
+					const float NewTurn = FMath::Clamp(SlideTurnAngle + Step, -SlideMaxTurnAngle, SlideMaxTurnAngle);
+					const float Applied = NewTurn - SlideTurnAngle;
+					if (!FMath::IsNearlyZero(Applied))
+					{
+						SlideDirection = FRotator(0.f, Applied, 0.f).RotateVector(SlideDirection).GetSafeNormal2D();
+						SlideTurnAngle = NewTurn;
+					}
+				}
+			}
+		}
+	}
 
-	// Left / right held: drift slightly sideways (the move input itself is locked during the slide,
-	// so read the move action directly).
+	// Left / right held: drift slightly sideways (only without steering).
 	float StrafeInput = 0.f;
 	FVector ViewRight = FVector::ZeroVector;
 	if (const ACharacter* Char = Character.Get())
@@ -431,6 +702,10 @@ void USlideComponent::TickSlide(float DeltaTime)
 		{
 			StrafeInput = FMath::Clamp(PlayerInput->GetActionValue(MoveAction).Get<FVector2D>().X, -1.f, 1.f);
 		}
+	}
+	if (bSlideBraking || bSlideSteering)
+	{
+		StrafeInput = 0.f; // braking / steering: no sideways drift
 	}
 	SlideStrafe = FMath::FInterpTo(SlideStrafe, StrafeInput * SlideStrafeSpeed, DeltaTime, SlideStrafeInterpSpeed);
 	CMC->Velocity = SlideDirection * Speed + ViewRight * SlideStrafe + FVector(0.f, 0.f, CMC->Velocity.Z);

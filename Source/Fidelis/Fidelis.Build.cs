@@ -12,7 +12,8 @@ public class Fidelis : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"InputCore",
-			"EnhancedInput"
+			"EnhancedInput",
+			"AnimationCore"
 		});
 	}
 }
